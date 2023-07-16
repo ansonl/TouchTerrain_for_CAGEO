@@ -324,3 +324,9 @@ Export.image.toDrive({
 // Click the Run button next to the task to start it. 
 // The image will be created in your Drive account with the specified fileFormat.
 ```
+
+## Anaconda
+
+To use TouchTerrain in the Anaconda/conda environment, install as usual with setup.py. 
+
+TouchTerrain installation in conda can be manually updated at `C:\Users\%USER%\.conda\envs\YOUR_ENV\Lib\site-packages\touchterrain`
