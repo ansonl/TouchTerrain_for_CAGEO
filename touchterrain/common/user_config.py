@@ -71,6 +71,10 @@ class TouchTerrainConfig:
     "allow degenerate triangles for difference mesh. Should only be used for Difference Mesh mode."
     edge_clipping_polygon: None | str = None
     "GPKG format file containing a single layer with polygon for edge clipping. The output mesh will be clipped along the polygon at sub-pixel resolution."
+    interlocking_mesh_pair = False
+    "Create paired lower-normal and difference meshes in one run so the difference bottom can reuse the lower-normal topology."
+    shared_z0_edge_corner_nudge = False
+    "Nudge corners on shared z=0 edges between cells. This fixes the nonmanifold error where an edge is used by more than 2 faces."
     max_cells_for_memory_only = 500 * 500 * 4
     "if total number of cells is bigger, use temp_file instead using memory only"
     no_normals = True 
