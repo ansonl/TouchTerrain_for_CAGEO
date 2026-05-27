@@ -69,10 +69,19 @@ class TouchTerrainConfig:
     "0 means all cores, None (null in JSON!) => don't use multiprocessing"
     dirty_triangles = False
     "allow degenerate triangles for difference mesh. Should only be used for Difference Mesh mode."
+    zero_height_tolerance: float = 0.0
+    """Tolerance in mm for zero-height cleanup.
+
+    Treat clipped top/bottom surfaces and wall vertices as equal when they are
+    within this tolerance. 0 means exact equality.
+    """
     edge_clipping_polygon: None | str = None
     "GPKG format file containing a single layer with polygon for edge clipping. The output mesh will be clipped along the polygon at sub-pixel resolution."
     interlocking_mesh_pair = False
-    "Create paired lower-normal and difference meshes in one run so the difference bottom can reuse the lower-normal topology."
+    """Create paired lower-normal and difference meshes in one run.
+
+    The pair is generated using the existing single-mesh generators.
+    """
     shared_z0_edge_corner_nudge = False
     "Nudge corners on shared z=0 edges between cells. This fixes the nonmanifold error where an edge is used by more than 2 faces."
     max_cells_for_memory_only = 500 * 500 * 4

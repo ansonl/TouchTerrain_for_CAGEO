@@ -41,7 +41,8 @@ import logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-from typing import Union, Any, Callable
+from collections.abc import Sequence
+from typing import Union, Any, Callable, TypeAlias
 
 import numpy as np
 import shapely
@@ -58,8 +59,17 @@ from touchterrain.common.RasterVariants import RasterVariants
 from touchterrain.common.BorderEdge import BorderEdge
 
 from touchterrain.common.shapely_utils import flatten_geometries
-from touchterrain.common.shapely_polygon_utils import polygon_to_list_of_vertex, polygons_equal_3d
+from touchterrain.common.shapely_polygon_utils import (
+    polygon_to_list_of_vertex,
+    polygons_equal_3d,
+)
 from touchterrain.common.interpolate_Z import interpolate_z_planar
+
+
+Coordinate: TypeAlias = Sequence[float]
+XYEdge: TypeAlias = tuple[tuple[float, float], tuple[float, float]]
+Edge3D: TypeAlias = tuple[tuple[float, ...], tuple[float, ...]]
+
 
 # function to calculate the normal for a triangle
 def get_normal(tri):
@@ -82,25 +92,46 @@ def get_normal(tri):
         normal = [c.x/m, c.y/m, c.z/m]
     return normal
 
-def make_wall_without_exact_duplicate_vertices(v0: vertex, v1: vertex, v2: vertex, v3: vertex) -> quad | None:
-    """Create a wall mesh, dropping exact duplicate vertices.
+def make_wall_without_exact_duplicate_vertices(
+    v0: vertex,
+    v1: vertex,
+    v2: vertex,
+    v3: vertex,
+    tolerance: float = 0.0,
+) -> quad | None:
+    """Create a wall mesh, dropping duplicate vertices.
 
     Difference meshes can produce wall endpoints where top and bottom are exactly
-    equal. In that case the wall should be a triangle, or omitted if the whole
-    wall has zero height.
+    equal. In that case the wall should be a triangle, or omitted when the
+    whole wall has zero height. A tolerance of ``0.0`` preserves exact
+    matching.
     """
     unique_vertices: list[vertex] = []
-    unique_coords: set[tuple[float, ...]] = set()
+
+    def same_vertex(a: vertex, b: vertex) -> bool:
+        if tolerance == 0.0:
+            return a.coords == b.coords
+        return (
+            abs(a.coords[0] - b.coords[0]) <= tolerance and
+            abs(a.coords[1] - b.coords[1]) <= tolerance and
+            abs(a.coords[2] - b.coords[2]) <= tolerance
+        )
+
     for v in (v0, v1, v2, v3):
-        if v.coords not in unique_coords:
+        if not any(same_vertex(v, existing) for existing in unique_vertices):
             unique_vertices.append(v)
-            unique_coords.add(v.coords)
 
     if len(unique_vertices) < 3:
         return None
     if len(unique_vertices) == 3:
         return quad(unique_vertices[0], unique_vertices[1], unique_vertices[2], None)
-    return quad(v0, v1, v2, v3)
+    return quad(
+        unique_vertices[0],
+        unique_vertices[1],
+        unique_vertices[2],
+        unique_vertices[3],
+    )
+
 
 class cell:
     '''a cell with a top and bottom quad, constructor: uses refs and does NOT copy ...
@@ -222,13 +253,151 @@ class cell:
 
         return None
     
-    def remove_zero_height_volumes(self):
-        """Remove volumes that should have zero height due to the top and bottom Z being equal.
+    def remove_zero_height_volumes(
+        self,
+        zero_height_tolerance: float = 0.0,
+    ) -> None:
+        """Remove zero-height cell geometry in place.
+
+        This mutates quads, cardinal borders, clipped surface polygons, and
+        clipped wall borders. Matching clipped top/bottom polygons are deleted,
+        then ``surfacePolygonBorders`` is filtered or rebuilt so only walls
+        still supported by both remaining clipped-surface boundaries are kept.
+        A tolerance of ``0.0`` means exact equality; nonzero values are
+        absolute model-unit tolerances.
         """
 
-        b = self.borders    
-        tq =  self.topquad.get_copy()
-        bq =  self.bottomquad.get_copy()
+        # Local helpers normalize clipped surface boundaries and edge
+        # signatures.
+        def remaining_surface_boundary(
+            surface_polygons: list[shapely.Polygon] | None,
+        ) -> shapely.Geometry | None:
+            # Build the old Shapely boundary representation only for guards.
+            if not surface_polygons:
+                return None
+            polygons_2d = [
+                shapely.force_2d(polygon)
+                for polygon in surface_polygons
+            ]
+            return shapely.union_all(polygons_2d).boundary
+
+        def surface_border_footprint(
+            surface_border: quad,
+        ) -> shapely.LineString | None:
+            # Collapse a clipped wall quad/tri to its two unique XY endpoints.
+            xy_coords: list[tuple[float, float]] = []
+            for v in surface_border.vl:
+                if v is None:
+                    continue
+                xy = (v.coords[0], v.coords[1])
+                if xy not in xy_coords:
+                    xy_coords.append(xy)
+            if len(xy_coords) != 2:
+                return None
+            return shapely.LineString(xy_coords)
+
+        def edge_xy_signature(
+            coord0: Coordinate,
+            coord1: Coordinate,
+        ) -> XYEdge:
+            # Normalize XY edge direction so dictionary lookup is stable.
+            return tuple(
+                sorted(
+                    (
+                        (coord0[0], coord0[1]),
+                        (coord1[0], coord1[1]),
+                    )
+                )
+            )
+
+        def edge_3d_signature(
+            coord0: Coordinate,
+            coord1: Coordinate,
+        ) -> Edge3D:
+            # Normalize 3D edge direction so top/bottom edge tests are stable.
+            return tuple(sorted((tuple(coord0[:3]), tuple(coord1[:3]))))
+
+        def polygon_edge_footprints(polygon: shapely.Polygon) -> set[XYEdge]:
+            # Collect all XY boundary edges for a removed clipped polygon.
+            footprints: set[XYEdge] = set()
+            rings = [polygon.exterior, *polygon.interiors]
+            for ring in rings:
+                coords = list(ring.coords)
+                for ci in range(len(coords) - 1):
+                    footprints.add(
+                        edge_xy_signature(coords[ci], coords[ci + 1])
+                    )
+            return footprints
+
+        def boundary_edge_map(
+            surface_polygons: list[shapely.Polygon] | None,
+        ) -> dict[XYEdge, Edge3D]:
+            # Count polygon edges; edges seen once are emitted boundaries.
+            edge_counts: dict[XYEdge, int] = {}
+            edge_coords: dict[XYEdge, Edge3D] = {}
+            if not surface_polygons:
+                return {}
+            for polygon in surface_polygons:
+                rings = [polygon.exterior, *polygon.interiors]
+                for ring in rings:
+                    coords = list(ring.coords)
+                    for ci in range(len(coords) - 1):
+                        footprint = edge_xy_signature(
+                            coords[ci],
+                            coords[ci + 1],
+                        )
+                        edge_counts[footprint] = (
+                            edge_counts.get(footprint, 0) + 1
+                        )
+                        edge_coords[footprint] = (
+                            tuple(coords[ci][:3]),
+                            tuple(coords[ci + 1][:3]),
+                        )
+            return {
+                footprint: coords
+                for footprint, coords in edge_coords.items()
+                if edge_counts[footprint] == 1
+            }
+
+        def surface_border_has_boundary_edges(
+            surface_border: quad,
+            top_edges: set[Edge3D],
+            bottom_edges: set[Edge3D],
+        ) -> bool:
+            # Confirm a wall's top and bottom 3D edges still exist.
+            vertices = [v for v in surface_border.vl if v is not None]
+            if len(vertices) == 4:
+                top_edge = edge_3d_signature(
+                    vertices[0].coords,
+                    vertices[1].coords,
+                )
+                bottom_edge = edge_3d_signature(
+                    vertices[2].coords,
+                    vertices[3].coords,
+                )
+                return top_edge in top_edges and bottom_edge in bottom_edges
+
+            non_vertical_edges: list[Edge3D] = []
+            # Triangular walls have one top and one bottom non-vertical edge.
+            for ai in range(len(vertices)):
+                for bi in range(ai + 1, len(vertices)):
+                    if vertices[ai].coords[:2] == vertices[bi].coords[:2]:
+                        continue
+                    non_vertical_edges.append(
+                        edge_3d_signature(
+                            vertices[ai].coords,
+                            vertices[bi].coords,
+                        )
+                    )
+
+            return (
+                any(edge in top_edges for edge in non_vertical_edges) and
+                any(edge in bottom_edges for edge in non_vertical_edges)
+            )
+
+        b = self.borders
+        tq = self.topquad.get_copy()
+        bq = self.bottomquad.get_copy()
         tvl = tq.vl
         bvl = bq.vl
         
@@ -238,9 +407,9 @@ class cell:
         The vertices seem to be a different mapping than commented in convert_to_tri_cell() and the above mapping makes much more sense for normals' directions. This assumes we are viewing the quad from straight above from the positive Z direction.
         """
         
-        # All vertexes of the top and bottom quad are at the same Z coordinate so the entire quad has 0 volume.
-        if (tvl[0].coords[2] == bvl[0].coords[2] and 
-                tvl[1].coords[2] == bvl[3].coords[2] and 
+        # First handle the cardinal quad cases, which have fixed corner order.
+        if (tvl[0].coords[2] == bvl[0].coords[2] and
+                tvl[1].coords[2] == bvl[3].coords[2] and
                 tvl[2].coords[2] == bvl[2].coords[2] and
                 tvl[3].coords[2] == bvl[1].coords[2]):
             self.topquad = None #quad(None, None, None, None)
@@ -278,22 +447,180 @@ class cell:
             self.bottomquad = quad(bvl[0], bvl[1], bvl[2], None)
             b["S"] = False #quad(tvl[2], tvl[0], bvl[0], bvl[2])
             b["W"] = False
-            
-        # for surface polygons we can remove matching tris that have the same Z for all vertex
+
+        # Remove matching clipped-surface tris with the same Z at every vertex.
+        removed_surface_polygon = False
+        removed_surface_edge_footprints: set[XYEdge] = set()
         if self.topSurfacePolygons and self.bottomSurfacePolygons:
             ti = 0
             while ti < len(self.topSurfacePolygons):
                 match = False
                 bi = 0
                 while bi < len(self.bottomSurfacePolygons):
-                    if polygons_equal_3d(self.topSurfacePolygons[ti], self.bottomSurfacePolygons[bi]):
+                    top_surface_polygon = self.topSurfacePolygons[ti]
+                    bottom_surface_polygon = self.bottomSurfacePolygons[bi]
+                    if polygons_equal_3d(
+                        top_surface_polygon,
+                        bottom_surface_polygon,
+                        tol=zero_height_tolerance,
+                    ):
+                        removed_surface_edge_footprints.update(
+                            polygon_edge_footprints(top_surface_polygon)
+                        )
+                        removed_surface_edge_footprints.update(
+                            polygon_edge_footprints(bottom_surface_polygon)
+                        )
                         del self.topSurfacePolygons[ti]
                         del self.bottomSurfacePolygons[bi]
+                        removed_surface_polygon = True
                         match = True
                         break
                     bi += 1
                 if not match:
                     ti += 1
+
+        if removed_surface_polygon:
+            # Rebuild remaining top/bottom boundary indexes after deletions.
+            top_boundary_edge_map = boundary_edge_map(self.topSurfacePolygons)
+            bottom_boundary_edge_map = boundary_edge_map(
+                self.bottomSurfacePolygons,
+            )
+            top_boundary_edges = {
+                edge_3d_signature(*edge)
+                for edge in top_boundary_edge_map.values()
+            }
+            bottom_boundary_edges = {
+                edge_3d_signature(*edge)
+                for edge in bottom_boundary_edge_map.values()
+            }
+
+            remaining_boundaries = None
+
+            def footprint_covered_by_remaining_boundaries(
+                footprint: shapely.LineString,
+            ) -> bool:
+                # Lazily run the previous Shapely covers check for diagnostics.
+                nonlocal remaining_boundaries
+                if remaining_boundaries is None:
+                    remaining_boundaries = (
+                        remaining_surface_boundary(self.topSurfacePolygons),
+                        remaining_surface_boundary(self.bottomSurfacePolygons),
+                    )
+
+                top_boundary, bottom_boundary = remaining_boundaries
+                return (
+                    top_boundary is not None
+                    and bottom_boundary is not None
+                    and top_boundary.covers(footprint)
+                    and bottom_boundary.covers(footprint)
+                )
+
+            def guard_exact_boundary_lookup(
+                footprint: shapely.LineString,
+                footprint_key: XYEdge,
+                has_exact_top: bool,
+                has_exact_bottom: bool,
+            ) -> None:
+                # Throw if old covers disagrees with exact edge lookup.
+                if not footprint_covered_by_remaining_boundaries(footprint):
+                    return
+
+                raise RuntimeError(
+                    "Clipped wall footprint is covered by remaining surface "
+                    "boundaries but does not match exact boundary edges: "
+                    f"footprint={footprint_key}, "
+                    f"top_exact={has_exact_top}, "
+                    f"bottom_exact={has_exact_bottom}"
+                )
+
+            # Keep only existing clipped walls still backed by both surfaces.
+            new_surface_polygon_borders: list[quad] = []
+            if self.surfacePolygonBorders:
+                for surface_border in self.surfacePolygonBorders:
+                    # Exact XY edge lookup is the optimized normal path.
+                    footprint = surface_border_footprint(surface_border)
+                    if footprint is None:
+                        continue
+
+                    footprint_key = edge_xy_signature(
+                        footprint.coords[0],
+                        footprint.coords[1],
+                    )
+                    has_exact_top = footprint_key in top_boundary_edge_map
+                    has_exact_bottom = (
+                        footprint_key in bottom_boundary_edge_map
+                    )
+                    if not (has_exact_top and has_exact_bottom):
+                        guard_exact_boundary_lookup(
+                            footprint,
+                            footprint_key,
+                            has_exact_top,
+                            has_exact_bottom,
+                        )
+                        continue
+
+                    if surface_border_has_boundary_edges(
+                        surface_border,
+                        top_boundary_edges,
+                        bottom_boundary_edges,
+                    ):
+                        new_surface_polygon_borders.append(surface_border)
+
+            # Track kept wall footprints so rebuilt walls are not duplicated.
+            existing_border_footprints: set[XYEdge] = set()
+            for surface_border in new_surface_polygon_borders:
+                footprint = surface_border_footprint(surface_border)
+                if footprint is not None:
+                    existing_border_footprints.add(
+                        edge_xy_signature(
+                            footprint.coords[0],
+                            footprint.coords[1],
+                        )
+                    )
+
+            # Recreate walls on newly exposed matching top/bottom boundaries.
+            for footprint in removed_surface_edge_footprints:
+                if footprint in existing_border_footprints:
+                    continue
+
+                has_exact_top = footprint in top_boundary_edge_map
+                has_exact_bottom = footprint in bottom_boundary_edge_map
+                if not (has_exact_top and has_exact_bottom):
+                    guard_exact_boundary_lookup(
+                        shapely.LineString(footprint),
+                        footprint,
+                        has_exact_top,
+                        has_exact_bottom,
+                    )
+                    continue
+
+                top_edge = top_boundary_edge_map[footprint]
+                bottom_edge = bottom_boundary_edge_map[footprint]
+                top_footprint = edge_xy_signature(top_edge[0], top_edge[1])
+                bottom_footprint = edge_xy_signature(
+                    bottom_edge[0],
+                    bottom_edge[1],
+                )
+                if top_footprint != bottom_footprint:
+                    continue
+                top_start_xy = (top_edge[0][0], top_edge[0][1])
+                bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
+                # Align bottom edge order to the top edge before wall creation.
+                if top_start_xy != bottom_start_xy:
+                    bottom_edge = (bottom_edge[1], bottom_edge[0])
+
+                tb_wall = make_wall_without_exact_duplicate_vertices(
+                    vertex(*top_edge[1]),
+                    vertex(*top_edge[0]),
+                    vertex(*bottom_edge[1]),
+                    vertex(*bottom_edge[0]),
+                    tolerance=zero_height_tolerance,
+                )
+                if tb_wall is not None:
+                    new_surface_polygon_borders.append(tb_wall)
+                    existing_border_footprints.add(footprint)
+
+            self.surfacePolygonBorders = new_surface_polygon_borders or None
 
 '''
 #profiling decorator
@@ -963,8 +1290,15 @@ class grid:
                 if j == 10 and i == 10:
                     pass
 
-                if self.tile.bottom_raster_variants is not None and self.tile_info.config.split_rotation == 1:
-                    c.remove_zero_height_volumes()
+                if (
+                    self.tile.bottom_raster_variants is not None
+                    and self.tile_info.config.split_rotation == 1
+                ):
+                    c.remove_zero_height_volumes(
+                        zero_height_tolerance=(
+                            self.tile_info.config.zero_height_tolerance
+                        ),
+                    )
 
                 # if we have nan cells, do some postprocessing on this cell to get rid of stair case patterns
                 # This will create special triangle cells that have a triangle of any orientation at top/bottom, which 

@@ -43,3 +43,11 @@ Cell creation logic order:
   - Ignore/remove zero volume meshes
 
 - Other processing steps for other userconfigs not mentioned should be left in place.
+
+## Change guidance
+
+- Reuse or adapt existing classes and functions if the changed logic is relevant.
+- Use existing imported libraries' features for convenience over recreating the same logic.
+- Prefer minimal code changes has long as the code is self documenting and human readable.
+  - Add concise comments for each major loop or step that is not immediately clear to a human what is being done.
+- Modified python code must conform to PEP 8, PEP 257, PEP 484

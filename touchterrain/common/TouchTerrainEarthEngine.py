@@ -225,7 +225,11 @@ def process_tile(processingTile: ProcessingTile):
         # if isinstance(processingTile.bottom_raster_variants.original, numpy.ndarray):
         #     tile_bottom_orig_full_raster = processingTile.bottom_raster_variants.original
 
-    logger.debug("processing tile:", tile_info.tile_no_x, tile_info.tile_no_y)
+    logger.debug(
+        "processing tile: %s %s",
+        tile_info.tile_no_x,
+        tile_info.tile_no_y,
+    )
     #print numpy.round(tile_elev_raster,1)
 
     # create a bottom relief raster (values 0.0 - 1.0)
@@ -697,6 +701,170 @@ def raster_preparation(top: RasterVariants, bottom: RasterVariants, top_hint: nu
         bottom.dilated = bot_npim.copy()
     return True
 
+
+def _is_mesh_zip_entry(entry_name: str, fileformat: str) -> bool:
+    """Return True when a zip entry is a mesh for the requested format."""
+    return entry_name.lower().endswith("." + fileformat[:3].lower())
+
+
+def _pair_mesh_entry_name(
+    source_entry_name: str,
+    output_base_name: str,
+    role: str,
+    fileformat: str,
+) -> str:
+    """Build the combined-zip mesh entry name for one pair role."""
+    source_stem = os.path.splitext(os.path.basename(source_entry_name))[0]
+    tile_suffix = ""
+    tile_marker_index = source_stem.lower().rfind("_tile_")
+    if tile_marker_index >= 0:
+        candidate_suffix = source_stem[tile_marker_index:]
+        suffix_parts = candidate_suffix.split("_")
+        if (
+            len(suffix_parts) == 4
+            and suffix_parts[1] == "tile"
+            and suffix_parts[2].isdigit()
+            and suffix_parts[3].isdigit()
+        ):
+            tile_suffix = candidate_suffix
+
+    return f"{output_base_name}_{role}{tile_suffix}.{fileformat[:3]}"
+
+
+def _copy_interlocking_pair_zip_entries(
+    output_zip: ZipFile,
+    source_zip_path: str,
+    output_base_name: str,
+    role: str,
+    fileformat: str,
+) -> tuple[float, bytes]:
+    """Copy mesh and logfile entries from a single run into the pair zip."""
+    copied_mesh_size_mb = 0.0
+    logfile = b""
+
+    with ZipFile(source_zip_path, "r") as source_zip:
+        for entry_name in sorted(source_zip.namelist()):
+            entry_data = source_zip.read(entry_name)
+            if _is_mesh_zip_entry(entry_name, fileformat):
+                output_entry_name = _pair_mesh_entry_name(
+                    source_entry_name=entry_name,
+                    output_base_name=output_base_name,
+                    role=role,
+                    fileformat=fileformat,
+                )
+                output_zip.writestr(output_entry_name, entry_data)
+                copied_mesh_size_mb += len(entry_data) / 1048576
+            elif entry_name == "logfile.txt":
+                logfile = entry_data
+                output_zip.writestr(f"logfile_{role}.txt", entry_data)
+
+    return copied_mesh_size_mb, logfile
+
+
+def _cleanup_interlocking_pair_temp_zip(
+    zip_path: str,
+    final_zip_path: str,
+) -> None:
+    """Remove an intermediate pair-mode zip without deleting the final zip."""
+    if os.path.abspath(zip_path) == os.path.abspath(final_zip_path):
+        return
+    try:
+        os.remove(zip_path)
+    except Exception as exc:
+        logger.error(
+            "Error removing interlocking pair temp zip %s: %s",
+            zip_path,
+            exc,
+        )
+
+
+def _get_interlocking_pair_zipped_tiles(
+    user_dict: dict[str, Any],
+    config: TouchTerrainConfig,
+) -> tuple[float, str]:
+    """Generate a normal/difference pair with the single-mesh pipeline."""
+    assert config.importedDEM is not None, (
+        "Error: interlocking_mesh_pair requires importedDEM as the upper "
+        "raster"
+    )
+    assert config.bottom_elevation is not None, (
+        "Error: interlocking_mesh_pair requires bottom_elevation as the "
+        "lower raster"
+    )
+
+    pair_base_name = config.zip_file_name
+    final_zip_file_name = os.path.join(
+        config.temp_folder,
+        pair_base_name + ".zip",
+    )
+
+    normal_args = copy.deepcopy(user_dict)
+    normal_args["importedDEM"] = config.bottom_elevation
+    normal_args["bottom_elevation"] = None
+    normal_args["top_elevation_hint"] = config.importedDEM
+    normal_args["importedDEM_interp"] = None
+    normal_args["dirty_triangles"] = TouchTerrainConfig().dirty_triangles
+    normal_args["interlocking_mesh_pair"] = False
+    normal_args["zip_file_name"] = pair_base_name + "_normal"
+    normal_args["temp_folder"] = config.temp_folder
+
+    difference_args = copy.deepcopy(user_dict)
+    difference_args["importedDEM"] = config.importedDEM
+    difference_args["bottom_elevation"] = config.bottom_elevation
+    difference_args["top_elevation_hint"] = None
+    difference_args["interlocking_mesh_pair"] = False
+    difference_args["zip_file_name"] = pair_base_name + "_difference"
+    difference_args["temp_folder"] = config.temp_folder
+
+    normal_size_mb, normal_zip_path = get_zipped_tiles(normal_args)
+    difference_size_mb, difference_zip_path = get_zipped_tiles(difference_args)
+
+    total_mesh_size_mb = 0.0
+    with ZipFile(final_zip_file_name, "w", allowZip64=True) as output_zip:
+        normal_mesh_size_mb, normal_log = _copy_interlocking_pair_zip_entries(
+            output_zip=output_zip,
+            source_zip_path=normal_zip_path,
+            output_base_name=pair_base_name,
+            role="normal",
+            fileformat=config.fileformat,
+        )
+        (
+            difference_mesh_size_mb,
+            difference_log,
+        ) = _copy_interlocking_pair_zip_entries(
+            output_zip=output_zip,
+            source_zip_path=difference_zip_path,
+            output_base_name=pair_base_name,
+            role="difference",
+            fileformat=config.fileformat,
+        )
+        total_mesh_size_mb = normal_mesh_size_mb + difference_mesh_size_mb
+
+        combined_log = (
+            "Interlocking mesh pair generated from existing single-mesh "
+            "runs.\n"
+            f"Normal run zip: {normal_zip_path} ({normal_size_mb:.6f} Mb)\n"
+            f"Difference run zip: {difference_zip_path} "
+            f"({difference_size_mb:.6f} Mb)\n\n"
+            f"--- normal logfile ---\n"
+        )
+        combined_log = (
+            combined_log.encode("utf-8")
+            + normal_log
+            + b"\n\n--- difference logfile ---\n"
+            + difference_log
+        )
+        output_zip.writestr("logfile.txt", combined_log)
+
+    _cleanup_interlocking_pair_temp_zip(normal_zip_path, final_zip_file_name)
+    _cleanup_interlocking_pair_temp_zip(
+        difference_zip_path,
+        final_zip_file_name,
+    )
+
+    return total_mesh_size_mb, final_zip_file_name
+
+
 def get_zipped_tiles(user_dict: dict[str, Any]):
     """
     args:
@@ -767,7 +935,12 @@ def get_zipped_tiles(user_dict: dict[str, Any]):
         else:
             config.zip_file_name = config.DEM_name    
 
-    
+    if config.interlocking_mesh_pair:
+        return _get_interlocking_pair_zipped_tiles(
+            user_dict=user_dict,
+            config=config,
+        )
+
 
     # set up log file
     log_file_name = config.temp_folder + os.sep + config.zip_file_name + ".log"
