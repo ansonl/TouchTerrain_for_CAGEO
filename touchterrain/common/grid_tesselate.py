@@ -69,6 +69,62 @@ from touchterrain.common.interpolate_Z import interpolate_z_planar
 Coordinate: TypeAlias = Sequence[float]
 XYEdge: TypeAlias = tuple[tuple[float, float], tuple[float, float]]
 Edge3D: TypeAlias = tuple[tuple[float, ...], tuple[float, ...]]
+SurfaceMesh: TypeAlias = Union[quad, shapely.Polygon]
+EmittedBottomSurface: TypeAlias = tuple[
+    quad | None,
+    list[shapely.Polygon] | None,
+]
+BottomSurfaceProvider: TypeAlias = list[list[EmittedBottomSurface]]
+
+
+def edge_xy_signature(coord0: Coordinate, coord1: Coordinate) -> XYEdge:
+    """Return an orientation-independent XY signature for an edge."""
+    return tuple(
+        sorted(
+            (
+                (coord0[0], coord0[1]),
+                (coord1[0], coord1[1]),
+            )
+        )
+    )
+
+
+def edge_3d_signature(coord0: Coordinate, coord1: Coordinate) -> Edge3D:
+    """Return an orientation-independent 3D signature for an edge."""
+    return tuple(sorted((tuple(coord0[:3]), tuple(coord1[:3]))))
+
+
+def boundary_edge_map_from_meshes(
+    meshes: list[SurfaceMesh] | None,
+) -> dict[XYEdge, Edge3D]:
+    """Return emitted boundary edges for quads and triangulated polygons."""
+    edge_counts: dict[XYEdge, int] = {}
+    edge_coords: dict[XYEdge, Edge3D] = {}
+    if not meshes:
+        return {}
+
+    def add_edge(coord0: Coordinate, coord1: Coordinate) -> None:
+        footprint = edge_xy_signature(coord0, coord1)
+        edge_counts[footprint] = edge_counts.get(footprint, 0) + 1
+        edge_coords[footprint] = (tuple(coord0[:3]), tuple(coord1[:3]))
+
+    for mesh in meshes:
+        if isinstance(mesh, quad):
+            coords = [v.coords for v in mesh.vl if v is not None]
+            for ci in range(len(coords)):
+                add_edge(coords[ci], coords[(ci + 1) % len(coords)])
+        elif isinstance(mesh, shapely.Polygon):
+            rings = [mesh.exterior, *mesh.interiors]
+            for ring in rings:
+                coords = list(ring.coords)
+                for ci in range(len(coords) - 1):
+                    add_edge(coords[ci], coords[ci + 1])
+
+    return {
+        footprint: coords
+        for footprint, coords in edge_coords.items()
+        if edge_counts[footprint] == 1
+    }
 
 
 # function to calculate the normal for a triangle
@@ -166,8 +222,8 @@ class cell:
         return r
 
     def meshes_for_model(self) -> list[Union[quad, shapely.Polygon]]:
-        """Returns a list of all the meshes to actually include in the ouitput model for this cell. Meshes are in the form of a quad or shapely.Polygon (triangulated)"""
-        meshes = []        
+        """Return the meshes to include in the output model for this cell."""
+        meshes = []
         if self.topSurfacePolygons:
             meshes.extend(self.topSurfacePolygons)
         elif self.topquad:
@@ -178,16 +234,220 @@ class cell:
         # else:
         # It is possible to have a cell with no top quad or topSurfacePolygon because all volumes in the cell were removed in zero volume check
         #     raise AttributeError("cell has no top quad or topSurfacePolygons")
-        
+
         if self.bottomSurfacePolygons:
             meshes.extend(self.bottomSurfacePolygons)
         elif self.bottomquad:
             meshes.append(self.bottomquad)
-            
+
         if self.surfacePolygonBorders:
             meshes.extend(self.surfacePolygonBorders)
-        
+
         return meshes
+
+    def emitted_top_as_bottom_surfaces(
+        self,
+    ) -> EmittedBottomSurface:
+        """Return emitted top surfaces reoriented for use as a bottom."""
+        if self.topSurfacePolygons:
+            return (
+                None,
+                [
+                    shapely.orient_polygons(polygon, exterior_cw=True)
+                    for polygon in self.topSurfacePolygons
+                ],
+            )
+
+        if self.topquad is None:
+            return None, None
+
+        top_vertices = self.topquad.vl
+        if top_vertices[3] is None:
+            return quad(top_vertices[0], top_vertices[2], top_vertices[1], None), None
+        return (
+            quad(
+                top_vertices[0],
+                top_vertices[3],
+                top_vertices[2],
+                top_vertices[1],
+            ),
+            None,
+        )
+
+    def replace_bottom_surfaces(
+        self,
+        bottom_surface_quad: quad | None,
+        bottom_surface_polygons: list[shapely.Polygon] | None,
+        zero_height_tolerance: float,
+        split_rotation: int,
+    ) -> None:
+        """Replace bottom geometry and rebuild walls against the current top.
+
+        Pair mode uses this after the normal mesh is emitted. The replacement
+        preserves the difference top surface and wall footprint decisions, but
+        swaps the bottom surface to the exact normal top geometry for the same
+        cell. A tolerance of ``0.0`` keeps wall duplicate removal exact.
+        """
+        replacement_bottom_quad = bottom_surface_quad
+        if self.topSurfacePolygons and bottom_surface_quad is not None:
+            bottom_surface_polygons = []
+            bottom_planes = bottom_surface_quad.get_triangles_in_polygons(
+                split_rotation=split_rotation,
+            )
+            for top_polygon in self.topSurfacePolygons:
+                bottom_polygon = interpolate_z_planar(
+                    geometry_2d=shapely.orient_polygons(
+                        shapely.force_2d(top_polygon),
+                        exterior_cw=True,
+                    ),
+                    planes_3d=bottom_planes,
+                )
+                if not isinstance(bottom_polygon, shapely.Polygon):
+                    raise TypeError(
+                        "Shared pair clipped bottom interpolation did not "
+                        "return a Polygon."
+                    )
+                bottom_surface_polygons.append(bottom_polygon)
+            bottom_surface_quad = None
+
+        if bottom_surface_polygons is not None:
+            if not self.topSurfacePolygons:
+                raise RuntimeError(
+                    "Shared pair bottom has clipped polygons but the "
+                    "difference top does not."
+                )
+            if replacement_bottom_quad is not None:
+                self.bottomquad = replacement_bottom_quad
+            self.bottomSurfacePolygons = bottom_surface_polygons
+            self.borders = {drct: False for drct in ["N", "S", "E", "W"]}
+            self._rebuild_surface_polygon_borders(zero_height_tolerance)
+            return
+
+        if bottom_surface_quad is None:
+            raise RuntimeError("Shared pair bottom surface is missing.")
+        if self.topquad is None:
+            raise RuntimeError("Difference top surface is missing.")
+
+        self.bottomquad = bottom_surface_quad
+        self.bottomSurfacePolygons = None
+        self.surfacePolygonBorders = None
+        self._rebuild_cardinal_borders(zero_height_tolerance)
+
+    def _rebuild_cardinal_borders(
+        self,
+        zero_height_tolerance: float,
+    ) -> None:
+        """Rebuild existing cardinal walls after replacing a bottom quad."""
+        top_vertices = self.topquad.vl
+        bottom_vertices = self.bottomquad.vl
+        rebuilt_borders = {drct: False for drct in ["N", "S", "E", "W"]}
+
+        if self.borders.get("N") is not False:
+            rebuilt_borders["N"] = (
+                make_wall_without_exact_duplicate_vertices(
+                    bottom_vertices[0],
+                    top_vertices[0],
+                    top_vertices[3],
+                    bottom_vertices[1],
+                    tolerance=zero_height_tolerance,
+                ) or False
+            )
+        if self.borders.get("S") is not False:
+            rebuilt_borders["S"] = (
+                make_wall_without_exact_duplicate_vertices(
+                    bottom_vertices[2],
+                    top_vertices[2],
+                    top_vertices[1],
+                    bottom_vertices[3],
+                    tolerance=zero_height_tolerance,
+                ) or False
+            )
+        if self.borders.get("E") is not False:
+            rebuilt_borders["E"] = (
+                make_wall_without_exact_duplicate_vertices(
+                    top_vertices[3],
+                    top_vertices[2],
+                    bottom_vertices[2],
+                    bottom_vertices[1],
+                    tolerance=zero_height_tolerance,
+                ) or False
+            )
+        if self.borders.get("W") is not False:
+            rebuilt_borders["W"] = (
+                make_wall_without_exact_duplicate_vertices(
+                    top_vertices[1],
+                    top_vertices[0],
+                    bottom_vertices[0],
+                    bottom_vertices[3],
+                    tolerance=zero_height_tolerance,
+                ) or False
+            )
+
+        self.borders = rebuilt_borders
+
+    def _rebuild_surface_polygon_borders(
+        self,
+        zero_height_tolerance: float,
+    ) -> None:
+        """Rebuild existing clipped wall footprints with shared bottom edges."""
+        requested_footprints: set[XYEdge] = set()
+        if self.surfacePolygonBorders:
+            for surface_border in self.surfacePolygonBorders:
+                xy_coords: list[tuple[float, float]] = []
+                for border_vertex in surface_border.vl:
+                    if border_vertex is None:
+                        continue
+                    xy = (
+                        border_vertex.coords[0],
+                        border_vertex.coords[1],
+                    )
+                    if xy not in xy_coords:
+                        xy_coords.append(xy)
+                if len(xy_coords) == 2:
+                    requested_footprints.add(
+                        edge_xy_signature(xy_coords[0], xy_coords[1])
+                    )
+
+        if not requested_footprints:
+            self.surfacePolygonBorders = None
+            return
+
+        top_boundary_edge_map = boundary_edge_map_from_meshes(
+            self.topSurfacePolygons,
+        )
+        bottom_boundary_edge_map = boundary_edge_map_from_meshes(
+            self.bottomSurfacePolygons,
+        )
+        missing_top = requested_footprints - set(top_boundary_edge_map)
+        missing_bottom = requested_footprints - set(bottom_boundary_edge_map)
+        if missing_top or missing_bottom:
+            raise RuntimeError(
+                "Shared pair clipped bottom boundaries do not match "
+                f"difference top boundaries. missing_bottom={missing_bottom}, "
+                f"missing_top={missing_top}"
+            )
+
+        rebuilt_borders: list[quad] = []
+        for footprint in requested_footprints:
+            top_edge = top_boundary_edge_map[footprint]
+            bottom_edge = bottom_boundary_edge_map[footprint]
+            top_start_xy = (top_edge[0][0], top_edge[0][1])
+            bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
+            # Keep bottom edge order opposite the top edge for wall quads.
+            if top_start_xy == bottom_start_xy:
+                bottom_edge = (bottom_edge[1], bottom_edge[0])
+
+            wall = make_wall_without_exact_duplicate_vertices(
+                vertex(*top_edge[1]),
+                vertex(*top_edge[0]),
+                vertex(*bottom_edge[1]),
+                vertex(*bottom_edge[0]),
+                tolerance=zero_height_tolerance,
+            )
+            if wall is not None:
+                rebuilt_borders.append(wall)
+
+        self.surfacePolygonBorders = rebuilt_borders or None
 
     def check_for_tri_cell(self):
         """Returns True if cell has borders on 2 consecutive sides False otherwise.
@@ -605,8 +865,8 @@ class cell:
                     continue
                 top_start_xy = (top_edge[0][0], top_edge[0][1])
                 bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
-                # Align bottom edge order to the top edge before wall creation.
-                if top_start_xy != bottom_start_xy:
+                # Keep bottom edge order opposite the top edge for wall quads.
+                if top_start_xy == bottom_start_xy:
                     bottom_edge = (bottom_edge[1], bottom_edge[0])
 
                 tb_wall = make_wall_without_exact_duplicate_vertices(
@@ -646,11 +906,22 @@ class ProcessingTile:
     tile_info: TouchTerrainTileInfo
     top_raster_variants: RasterVariants
     bottom_raster_variants: Union[None, RasterVariants]
-    
-    def __init__(self, tile_info: TouchTerrainTileInfo, top: RasterVariants, bottom: Union[None, RasterVariants]):
+    bottom_surface_provider: BottomSurfaceProvider | None
+    return_grid: bool
+
+    def __init__(
+        self,
+        tile_info: TouchTerrainTileInfo,
+        top: RasterVariants,
+        bottom: Union[None, RasterVariants],
+        bottom_surface_provider: BottomSurfaceProvider | None = None,
+        return_grid: bool = False,
+    ):
         self.tile_info = tile_info
         self.top_raster_variants = top
         self.bottom_raster_variants = bottom
+        self.bottom_surface_provider = bottom_surface_provider
+        self.return_grid = return_grid
    
 def interpolate_with_NaN(elev: np.ndarray, i, j) -> tuple[float|None, float|None, float|None, float|None]:
     '''Get elevation of 4 corners of current cell and return them as NEelev, NWelev, SEelev, SWelev
@@ -908,10 +1179,28 @@ class grid:
             self.tile_info.N =  self.tile_info.tile_height / 2
 
     def clean_up_diags_check(self, ras):
-        '''Local function to check for NaNs in the raster and clean up diagonal NaNs if requested'''
+        """Check for NaNs in the raster and clean diagonal NaNs if requested."""
         if np.any(np.isnan(ras)) == True: # do we have any NaNs?
             if self.tile_info.config.clean_diags == True: # cleanup requested?
                 ras = utils.clean_up_diags(ras)
+
+    def extract_emitted_top_bottom_surfaces(self) -> BottomSurfaceProvider:
+        """Return each emitted top surface reoriented as bottom geometry."""
+        if self.cells is None:
+            raise RuntimeError("Cannot extract surfaces before cells exist.")
+
+        surfaces: BottomSurfaceProvider = []
+        for row in self.cells:
+            surface_row: list[EmittedBottomSurface] = []
+            for current_cell in row:
+                if current_cell is None:
+                    surface_row.append((None, None))
+                else:
+                    surface_row.append(
+                        current_cell.emitted_top_as_bottom_surfaces()
+                    )
+            surfaces.append(surface_row)
+        return surfaces
 
     def create_cells(self):
         '''Creates a data structure for each raster cell based on quads for top, any walls and possible bottom.
@@ -1282,6 +1571,32 @@ class grid:
                 if surface_polygon_borders_3D:
                     c.surfacePolygonBorders = surface_polygon_borders_3D
 
+                if self.tile.bottom_surface_provider is not None:
+                    bottom_provider = self.tile.bottom_surface_provider
+                    bottom_quad, bottom_polygons = bottom_provider[j - 1][
+                        i - 1
+                    ]
+                    if bottom_quad is None and bottom_polygons is None:
+                        if (
+                            c.bottomquad is None
+                            and c.bottomSurfacePolygons is None
+                        ):
+                            raise RuntimeError(
+                                "Interlocking pair difference cell needs a "
+                                f"bottom surface at row={j - 1}, col={i - 1}."
+                            )
+                    else:
+                        c.replace_bottom_surfaces(
+                            bottom_surface_quad=bottom_quad,
+                            bottom_surface_polygons=bottom_polygons,
+                            zero_height_tolerance=(
+                                self.tile_info.config.zero_height_tolerance
+                            ),
+                            split_rotation=(
+                                self.tile_info.config.split_rotation
+                            ),
+                        )
+
                 # DEBUG: store i,j, and central elev
                 #c.iy = j-1
                 #c.ix = i-1
@@ -1305,17 +1620,23 @@ class grid:
                 # are flagged as is_tri_cell = True, and have only v0, v1 and v2. One border is deleted, the other
                 # is set as a diagonal wall.
                 # Note: this will not be done if we have a bottom as it will lead to lots of triangle holes! 
-                if self.tile_info.have_nan == True and self.tile_info.config.smooth_borders == True and self.tile.bottom_raster_variants is None: #self.tile_info.have_bottom_array == False:
+                if (
+                    self.tile_info.have_nan == True
+                    and self.tile_info.config.smooth_borders == True
+                    and self.tile.bottom_raster_variants is None
+                ):
                     #print(i,j, c.borders)
                     if c.check_for_tri_cell():
-                        c.convert_to_tri_cell()  # collapses top and bot quads into a triangle quad and make diagonal wall
-                
+                        c.convert_to_tri_cell()
+
+                self.cells[j - 1, i - 1] = c
+
                 #endregion
-                
+
                 #
                 # Make quads for top, bottom and walls
                 #
-                
+
                 # list of meshes for this cell,
                 meshes = c.meshes_for_model()
                 

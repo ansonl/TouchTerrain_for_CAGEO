@@ -44,7 +44,11 @@ if DEV_MODE:
     sys.path = ["."] + sys.path # force imports form local touchterain folder
 
 import touchterrain.common
-from touchterrain.common.grid_tesselate import grid, RasterVariants, ProcessingTile      # my own grid class, creates a mesh from DEM raster
+from touchterrain.common.grid_tesselate import (
+    BottomSurfaceProvider,
+    ProcessingTile,
+    grid,
+)
 from touchterrain.common.user_config import TouchTerrainConfig
 from touchterrain.common.tile_info import TouchTerrainTileInfo
 from touchterrain.common.Coordinate_system_conv import * # arc to meters conversion
@@ -429,6 +433,8 @@ def process_tile(processingTile: ProcessingTile):
     # When using top and bottom and multiple tiles it is possible that a water tile is empty
     # b/c no water cells cross it. In this case we return the tile_info and None so it gets ignored
     if g.num_triangles == 0:
+        if processingTile.return_grid:
+            return tile_info, None, g
         return tile_info, None
 
     # get size of file/buffer
@@ -440,6 +446,8 @@ def process_tile(processingTile: ProcessingTile):
 
     tile_info.file_size = fsize
     print("tile", tile_info.tile_no_x, tile_info.tile_no_y, fileformat, fsize, "Mb ", file=sys.stderr) #, multiprocessing.current_process()
+    if processingTile.return_grid:
+        return tile_info, b, g
     return tile_info, b # return info and buffer/temp_file NAME
 
 
@@ -594,6 +602,14 @@ def get_print3D_dimensions(dem: gdal.Dataset, tile_scale) -> tuple[float, float]
     print3D_height_per_tile = dem_pixel_width_y * 1000 * dem.RasterYSize / tile_scale
     return (print3D_width_per_tile, print3D_height_per_tile)
 
+
+def _get_gdal_projection_and_datum(raster: gdal.Dataset) -> tuple[Any, Any]:
+    """Return projection and datum strings for a GDAL raster."""
+    spatial_ref = raster.GetProjection()
+    sr = osr.SpatialReference()
+    sr.ImportFromWkt(spatial_ref)
+    return sr.GetAttrValue("PROJECTION"), sr.GetAttrValue("DATUM")
+
 def raster_preparation(top: RasterVariants, bottom: RasterVariants, top_hint: numpy.ndarray|None = None, bottom_thru_base: bool = False, bottom_floor_elev: float|None = None) -> bool:
     """Prepare rasters by NaN close values, dilate
     
@@ -702,87 +718,10 @@ def raster_preparation(top: RasterVariants, bottom: RasterVariants, top_hint: nu
     return True
 
 
-def _is_mesh_zip_entry(entry_name: str, fileformat: str) -> bool:
-    """Return True when a zip entry is a mesh for the requested format."""
-    return entry_name.lower().endswith("." + fileformat[:3].lower())
-
-
-def _pair_mesh_entry_name(
-    source_entry_name: str,
-    output_base_name: str,
-    role: str,
-    fileformat: str,
-) -> str:
-    """Build the combined-zip mesh entry name for one pair role."""
-    source_stem = os.path.splitext(os.path.basename(source_entry_name))[0]
-    tile_suffix = ""
-    tile_marker_index = source_stem.lower().rfind("_tile_")
-    if tile_marker_index >= 0:
-        candidate_suffix = source_stem[tile_marker_index:]
-        suffix_parts = candidate_suffix.split("_")
-        if (
-            len(suffix_parts) == 4
-            and suffix_parts[1] == "tile"
-            and suffix_parts[2].isdigit()
-            and suffix_parts[3].isdigit()
-        ):
-            tile_suffix = candidate_suffix
-
-    return f"{output_base_name}_{role}{tile_suffix}.{fileformat[:3]}"
-
-
-def _copy_interlocking_pair_zip_entries(
-    output_zip: ZipFile,
-    source_zip_path: str,
-    output_base_name: str,
-    role: str,
-    fileformat: str,
-) -> tuple[float, bytes]:
-    """Copy mesh and logfile entries from a single run into the pair zip."""
-    copied_mesh_size_mb = 0.0
-    logfile = b""
-
-    with ZipFile(source_zip_path, "r") as source_zip:
-        for entry_name in sorted(source_zip.namelist()):
-            entry_data = source_zip.read(entry_name)
-            if _is_mesh_zip_entry(entry_name, fileformat):
-                output_entry_name = _pair_mesh_entry_name(
-                    source_entry_name=entry_name,
-                    output_base_name=output_base_name,
-                    role=role,
-                    fileformat=fileformat,
-                )
-                output_zip.writestr(output_entry_name, entry_data)
-                copied_mesh_size_mb += len(entry_data) / 1048576
-            elif entry_name == "logfile.txt":
-                logfile = entry_data
-                output_zip.writestr(f"logfile_{role}.txt", entry_data)
-
-    return copied_mesh_size_mb, logfile
-
-
-def _cleanup_interlocking_pair_temp_zip(
-    zip_path: str,
-    final_zip_path: str,
-) -> None:
-    """Remove an intermediate pair-mode zip without deleting the final zip."""
-    if os.path.abspath(zip_path) == os.path.abspath(final_zip_path):
-        return
-    try:
-        os.remove(zip_path)
-    except Exception as exc:
-        logger.error(
-            "Error removing interlocking pair temp zip %s: %s",
-            zip_path,
-            exc,
-        )
-
-
 def _get_interlocking_pair_zipped_tiles(
-    user_dict: dict[str, Any],
     config: TouchTerrainConfig,
 ) -> tuple[float, str]:
-    """Generate a normal/difference pair with the single-mesh pipeline."""
+    """Generate an interlocking pair from shared prepared rasters."""
     assert config.importedDEM is not None, (
         "Error: interlocking_mesh_pair requires importedDEM as the upper "
         "raster"
@@ -791,6 +730,14 @@ def _get_interlocking_pair_zipped_tiles(
         "Error: interlocking_mesh_pair requires bottom_elevation as the "
         "lower raster"
     )
+    assert config.top_elevation_hint is None, (
+        "Error: interlocking_mesh_pair derives top_elevation_hint from "
+        "importedDEM; do not set top_elevation_hint in pair mode"
+    )
+    assert config.fileformat != "GeoTiff", (
+        "Error: interlocking_mesh_pair creates mesh pairs and does not "
+        "support GeoTiff output"
+    )
 
     pair_base_name = config.zip_file_name
     final_zip_file_name = os.path.join(
@@ -798,71 +745,793 @@ def _get_interlocking_pair_zipped_tiles(
         pair_base_name + ".zip",
     )
 
-    normal_args = copy.deepcopy(user_dict)
-    normal_args["importedDEM"] = config.bottom_elevation
-    normal_args["bottom_elevation"] = None
-    normal_args["top_elevation_hint"] = config.importedDEM
-    normal_args["importedDEM_interp"] = None
-    normal_args["dirty_triangles"] = TouchTerrainConfig().dirty_triangles
-    normal_args["interlocking_mesh_pair"] = False
-    normal_args["zip_file_name"] = pair_base_name + "_normal"
-    normal_args["temp_folder"] = config.temp_folder
-
-    difference_args = copy.deepcopy(user_dict)
-    difference_args["importedDEM"] = config.importedDEM
-    difference_args["bottom_elevation"] = config.bottom_elevation
-    difference_args["top_elevation_hint"] = None
-    difference_args["interlocking_mesh_pair"] = False
-    difference_args["zip_file_name"] = pair_base_name + "_difference"
-    difference_args["temp_folder"] = config.temp_folder
-
-    normal_size_mb, normal_zip_path = get_zipped_tiles(normal_args)
-    difference_size_mb, difference_zip_path = get_zipped_tiles(difference_args)
-
-    total_mesh_size_mb = 0.0
-    with ZipFile(final_zip_file_name, "w", allowZip64=True) as output_zip:
-        normal_mesh_size_mb, normal_log = _copy_interlocking_pair_zip_entries(
-            output_zip=output_zip,
-            source_zip_path=normal_zip_path,
-            output_base_name=pair_base_name,
-            role="normal",
-            fileformat=config.fileformat,
-        )
-        (
-            difference_mesh_size_mb,
-            difference_log,
-        ) = _copy_interlocking_pair_zip_entries(
-            output_zip=output_zip,
-            source_zip_path=difference_zip_path,
-            output_base_name=pair_base_name,
-            role="difference",
-            fileformat=config.fileformat,
-        )
-        total_mesh_size_mb = normal_mesh_size_mb + difference_mesh_size_mb
-
-        combined_log = (
-            "Interlocking mesh pair generated from existing single-mesh "
-            "runs.\n"
-            f"Normal run zip: {normal_zip_path} ({normal_size_mb:.6f} Mb)\n"
-            f"Difference run zip: {difference_zip_path} "
-            f"({difference_size_mb:.6f} Mb)\n\n"
-            f"--- normal logfile ---\n"
-        )
-        combined_log = (
-            combined_log.encode("utf-8")
-            + normal_log
-            + b"\n\n--- difference logfile ---\n"
-            + difference_log
-        )
-        output_zip.writestr("logfile.txt", combined_log)
-
-    _cleanup_interlocking_pair_temp_zip(normal_zip_path, final_zip_file_name)
-    _cleanup_interlocking_pair_temp_zip(
-        difference_zip_path,
-        final_zip_file_name,
+    log_file_name = os.path.join(
+        config.temp_folder,
+        pair_base_name + ".log",
     )
+    log_file_handler = logging.FileHandler(log_file_name, mode="w+")
+    formatter = logging.Formatter("%(message)s")
+    log_file_handler.setFormatter(formatter)
+    logger.addHandler(log_file_handler)
 
-    return total_mesh_size_mb, final_zip_file_name
+    try:
+        num_tiles = [int(config.ntilesx), int(config.ntilesy)]
+        if config.only is not None:
+            assert 0 < config.only[0] <= num_tiles[0], (
+                "Error: x index of only tile out of range"
+            )
+            assert 0 < config.only[1] <= num_tiles[1], (
+                "Error: y index of only tile out of range"
+            )
+
+        pr(
+            "Log for creating",
+            num_tiles[0],
+            "x",
+            num_tiles[1],
+            "interlocking mesh pair tile(s) from",
+            os.path.basename(config.bottom_elevation),
+            "and",
+            os.path.basename(config.importedDEM),
+            "\n",
+        )
+        pr("started:", datetime.datetime.now().time().isoformat())
+
+        upper_dem = gdal.Open(config.importedDEM)
+        lower_dem = gdal.Open(config.bottom_elevation)
+        assert upper_dem is not None, (
+            "Error: could not open upper raster " + config.importedDEM
+        )
+        assert lower_dem is not None, (
+            "Error: could not open lower raster " + config.bottom_elevation
+        )
+
+        upper_band = upper_dem.GetRasterBand(1)
+        lower_band = lower_dem.GetRasterBand(1)
+        difference_upper_npim = cast(
+            numpy.ndarray,
+            upper_band.ReadAsArray(),
+        ).astype(numpy.float64)
+        normal_lower_npim = cast(
+            numpy.ndarray,
+            lower_band.ReadAsArray(),
+        ).astype(numpy.float64)
+
+        if (
+            upper_dem.RasterXSize != lower_dem.RasterXSize
+            or upper_dem.RasterYSize != lower_dem.RasterYSize
+        ):
+            raise AssertionError(
+                "Error: interlocking pair upper/lower raster sizes do not "
+                "match"
+            )
+
+        upper_tf = upper_dem.GetGeoTransform()
+        lower_tf = lower_dem.GetGeoTransform()
+        upper_pw, upper_ph = abs(upper_tf[1]), abs(upper_tf[5])
+        lower_pw, lower_ph = abs(lower_tf[1]), abs(lower_tf[5])
+        if upper_pw != upper_ph:
+            logger.warning(
+                "Warning: upper raster cells are not square (%sx%s), using %s",
+                upper_pw,
+                upper_ph,
+                upper_pw,
+            )
+        if lower_pw != lower_ph:
+            logger.warning(
+                "Warning: lower raster cells are not square (%sx%s), using %s",
+                lower_pw,
+                lower_ph,
+                lower_pw,
+            )
+        if upper_pw != lower_pw:
+            raise AssertionError(
+                "Error: interlocking pair upper/lower raster cell sizes do "
+                "not match"
+            )
+        cell_size_m = upper_pw
+        geo_transform = upper_tf
+
+        upper_proj, upper_datum = _get_gdal_projection_and_datum(upper_dem)
+        lower_proj, lower_datum = _get_gdal_projection_and_datum(lower_dem)
+        if upper_proj != lower_proj or upper_datum != lower_datum:
+            raise AssertionError(
+                "Error: interlocking pair upper/lower projections do not "
+                "match"
+            )
+
+        upper_undef_val = upper_band.GetNoDataValue()
+        lower_undef_val = lower_band.GetNoDataValue()
+        pr("undefined upper DEM value:", upper_undef_val)
+        pr("undefined lower DEM value:", lower_undef_val)
+        if upper_undef_val is not None:
+            difference_upper_npim = numpy.where(
+                numpy.isclose(difference_upper_npim, upper_undef_val),
+                numpy.nan,
+                difference_upper_npim,
+            )
+        if lower_undef_val is not None:
+            normal_lower_npim = numpy.where(
+                numpy.isclose(normal_lower_npim, lower_undef_val),
+                numpy.nan,
+                normal_lower_npim,
+            )
+
+        difference_lower_npim = normal_lower_npim.copy()
+
+        interp_npim: numpy.ndarray | None = None
+        if config.importedDEM_interp:
+            interp_dem = gdal.Open(config.importedDEM_interp)
+            assert interp_dem is not None, (
+                "Error: could not open interpolation raster "
+                + config.importedDEM_interp
+            )
+            interp_band = interp_dem.GetRasterBand(1)
+            interp_npim = cast(
+                numpy.ndarray,
+                interp_band.ReadAsArray(),
+            ).astype(numpy.float64)
+            if upper_undef_val is not None:
+                interp_npim = numpy.where(
+                    numpy.isclose(interp_npim, upper_undef_val),
+                    numpy.nan,
+                    interp_npim,
+                )
+            del interp_band
+            interp_dem = None
+
+        offset_npim: list[numpy.ndarray] = []
+        if config.offset_masks_lower is not None:
+            for offset_pair in config.offset_masks_lower:
+                offset_dem = gdal.Open(offset_pair[0])
+                assert offset_dem is not None, (
+                    "Error: could not open offset mask " + offset_pair[0]
+                )
+                offset_band = offset_dem.GetRasterBand(1)
+                offset_npim.append(
+                    offset_band.ReadAsArray().astype(numpy.float64),
+                )
+                del offset_band
+                offset_dem = None
+
+        if config.ignore_leq is not None:
+            normal_lower_npim = numpy.where(
+                normal_lower_npim <= config.ignore_leq,
+                numpy.nan,
+                normal_lower_npim,
+            )
+            difference_upper_npim = numpy.where(
+                difference_upper_npim <= config.ignore_leq,
+                numpy.nan,
+                difference_upper_npim,
+            )
+            if interp_npim is not None:
+                interp_npim = numpy.where(
+                    interp_npim <= config.ignore_leq,
+                    numpy.nan,
+                    interp_npim,
+                )
+            pr("ignoring elevations <= ", config.ignore_leq)
+
+        def omit_extreme_values(
+            raster: numpy.ndarray,
+            label: str,
+        ) -> numpy.ndarray:
+            """Mask extreme imported elevations the same way local runs do."""
+            if numpy.nanmin(raster) < -16384:
+                raster = numpy.where(raster < -16384, numpy.nan, raster)
+                pr("omitting", label, "cells with elevation < -16384")
+            if numpy.nanmax(raster) > 16384:
+                raster = numpy.where(raster > 16384, numpy.nan, raster)
+                pr("omitting", label, "cells with elevation > 16384")
+            return raster
+
+        normal_lower_npim = omit_extreme_values(
+            normal_lower_npim,
+            "normal lower",
+        )
+        difference_upper_npim = omit_extreme_values(
+            difference_upper_npim,
+            "difference upper",
+        )
+
+        print3D_resolution_mm = config.printres
+        if config.tilewidth_scale is not None:
+            real_world_width_m = difference_upper_npim.shape[1] * cell_size_m
+            config.tilewidth = (
+                real_world_width_m / config.tilewidth_scale * 1000
+            )
+            pr(
+                "Overriding tilewidth using a tilewidth_scale of 1 :",
+                config.tilewidth_scale,
+                ", raster width is",
+                real_world_width_m,
+                "m, new tilewidth is",
+                config.tilewidth,
+                "mm.",
+            )
+
+        if config.tileScale is not None:
+            pr("tileScale:", config.tileScale)
+            print3D_width_per_tile, print3D_height_per_tile = (
+                get_print3D_dimensions(
+                    dem=upper_dem,
+                    tile_scale=config.tileScale,
+                )
+            )
+        else:
+            whratio = difference_upper_npim.shape[0] / float(
+                difference_upper_npim.shape[1],
+            )
+            print3D_width_per_tile = config.tilewidth
+            print3D_height_per_tile = config.tilewidth * whratio
+            pr("tile_width:", config.tilewidth)
+            pr("tile_height:", print3D_height_per_tile)
+
+        print3D_width_total_mm = print3D_width_per_tile * num_tiles[0]
+        source_print3D_resolution = print3D_width_total_mm / float(
+            difference_upper_npim.shape[1],
+        )
+        pr(
+            "source raster 3D print resolution would be",
+            source_print3D_resolution,
+            "mm",
+        )
+
+        if config.printres <= 0:
+            print3D_resolution_mm = source_print3D_resolution
+            pr(
+                "no resampling, using source resolution of",
+                source_print3D_resolution,
+                "mm",
+            )
+        else:
+            scale_factor = print3D_resolution_mm / float(
+                source_print3D_resolution,
+            )
+            pr(
+                "re-sampling shared interlocking rasters from",
+                source_print3D_resolution,
+                "mm to",
+                print3D_resolution_mm,
+                "mm",
+            )
+            normal_lower_npim = resampleDEM(normal_lower_npim, scale_factor)
+            difference_upper_npim = resampleDEM(
+                difference_upper_npim,
+                scale_factor,
+            )
+            difference_lower_npim = resampleDEM(
+                difference_lower_npim,
+                scale_factor,
+            )
+            if interp_npim is not None:
+                interp_npim = resampleDEM(interp_npim, scale_factor)
+            for index, offset_layer in enumerate(offset_npim):
+                offset_npim[index] = resampleDEM(offset_layer, scale_factor)
+
+            region_ratio = difference_upper_npim.shape[0] / float(
+                difference_upper_npim.shape[1],
+            )
+            print3D_width_per_tile = config.tilewidth
+            print3D_height_per_tile = (
+                print3D_width_per_tile * num_tiles[0] * region_ratio
+            ) / float(num_tiles[1])
+            if config.tileScale is not None:
+                print3D_width_per_tile, print3D_height_per_tile = (
+                    get_print3D_dimensions(
+                        dem=upper_dem,
+                        tile_scale=config.tileScale,
+                    )
+                )
+
+            print3D_width_total_mm = print3D_width_per_tile * num_tiles[0]
+            adjusted_print3D_resolution = print3D_width_total_mm / float(
+                difference_upper_npim.shape[1],
+            )
+            cell_size_m *= scale_factor
+            if adjusted_print3D_resolution != print3D_resolution_mm:
+                pr(
+                    "after resampling, requested print res was adjusted from",
+                    print3D_resolution_mm,
+                    "to",
+                    adjusted_print3D_resolution,
+                )
+                print3D_resolution_mm = adjusted_print3D_resolution
+
+        remx = difference_upper_npim.shape[1] % num_tiles[0]
+        remy = difference_upper_npim.shape[0] % num_tiles[1]
+        if remx > 0 or remy > 0:
+            pr(
+                f"Cropping for nice fit of {num_tiles[0]} x "
+                f"{num_tiles[1]} tiles, removing: {remx} columns, "
+                f"{remy} rows"
+            )
+            old_shape = difference_upper_npim.shape
+            row_slice = slice(0, difference_upper_npim.shape[0] - remy)
+            col_slice = slice(0, difference_upper_npim.shape[1] - remx)
+            normal_lower_npim = normal_lower_npim[row_slice, col_slice]
+            difference_upper_npim = difference_upper_npim[
+                row_slice,
+                col_slice,
+            ]
+            difference_lower_npim = difference_lower_npim[
+                row_slice,
+                col_slice,
+            ]
+            if interp_npim is not None:
+                interp_npim = interp_npim[row_slice, col_slice]
+            for index, offset_layer in enumerate(offset_npim):
+                offset_npim[index] = offset_layer[row_slice, col_slice]
+
+            ratio = (
+                old_shape[0] / float(difference_upper_npim.shape[0]),
+                old_shape[1] / float(difference_upper_npim.shape[1]),
+            )
+            print3D_width_per_tile = print3D_width_per_tile / ratio[1]
+            print3D_height_per_tile = print3D_height_per_tile / ratio[0]
+            print3D_width_total_mm = print3D_width_per_tile * num_tiles[0]
+
+        print3D_scale_number = (
+            difference_upper_npim.shape[1] * cell_size_m
+        ) / (print3D_width_total_mm / 1000.0)
+        pr("map scale is 1 :", print3D_scale_number)
+
+        if config.zscale < 0:
+            unscaled_elev_range_m = (
+                numpy.nanmax(difference_upper_npim)
+                - numpy.nanmin(difference_upper_npim)
+            )
+            scaled_elev_range_m = (
+                unscaled_elev_range_m / print3D_scale_number
+            )
+            requested_elev_range_m = -config.zscale / 1000
+            config.zscale = requested_elev_range_m / scaled_elev_range_m
+            pr("calculated z-scale:", config.zscale)
+
+        if config.lower_leq is not None:
+            assert len(config.lower_leq) == 2, (
+                "lower_leq should have the format [threshold, offset]. "
+                f"Got {config.lower_leq}"
+            )
+            threshold = config.lower_leq[0]
+            offset = config.lower_leq[1] / 1000 * print3D_scale_number
+            offset /= config.zscale
+            normal_lower_npim = numpy.where(
+                normal_lower_npim > threshold,
+                normal_lower_npim + offset,
+                normal_lower_npim,
+            )
+            difference_upper_npim = numpy.where(
+                difference_upper_npim > threshold,
+                difference_upper_npim + offset,
+                difference_upper_npim,
+            )
+            pr(
+                "Lowering elevations <=",
+                threshold,
+                "by",
+                offset,
+                "m",
+            )
+
+        if config.offset_masks_lower is not None:
+            for index, offset_layer in enumerate(offset_npim):
+                offset = (
+                    config.offset_masks_lower[index][1]
+                    / 1000
+                    * print3D_scale_number
+                )
+                offset /= config.zscale
+                offset_layer = numpy.where(offset_layer > 0, 0, 1)
+                offset_layer = numpy.multiply(offset_layer, offset)
+                normal_lower_npim = numpy.add(normal_lower_npim, offset_layer)
+                difference_upper_npim = numpy.add(
+                    difference_upper_npim,
+                    offset_layer,
+                )
+                normal_lower_npim = numpy.where(
+                    normal_lower_npim < 0,
+                    0,
+                    normal_lower_npim,
+                )
+                difference_upper_npim = numpy.where(
+                    difference_upper_npim < 0,
+                    0,
+                    difference_upper_npim,
+                )
+
+        if (
+            config.fill_holes is not None
+            and (config.fill_holes[0] > 0 or config.fill_holes[0] == -1)
+        ):
+            normal_lower_npim = fillHoles(
+                normal_lower_npim,
+                num_iters=config.fill_holes[0],
+                num_neighbors=config.fill_holes[1],
+            )
+            difference_upper_npim = fillHoles(
+                difference_upper_npim,
+                num_iters=config.fill_holes[0],
+                num_neighbors=config.fill_holes[1],
+            )
+            difference_lower_npim = fillHoles(
+                difference_lower_npim,
+                num_iters=config.fill_holes[0],
+                num_neighbors=config.fill_holes[1],
+            )
+
+        shared_min_elev = config.min_elev
+        if shared_min_elev is None:
+            shared_min_elev = min(
+                numpy.nanmin(normal_lower_npim),
+                numpy.nanmin(difference_upper_npim),
+            )
+
+        normal_config = copy.deepcopy(config)
+        normal_config.bottom_elevation = None
+        normal_config.dirty_triangles = TouchTerrainConfig().dirty_triangles
+        normal_config.min_elev = shared_min_elev
+
+        difference_config = copy.deepcopy(config)
+        difference_config.min_elev = shared_min_elev
+
+        normal_top_variants = RasterVariants(
+            original=normal_lower_npim,
+            nan_close=None,
+            dilated=None,
+            edge_interpolation=None,
+        )
+        normal_bottom_variants = RasterVariants(
+            original=None,
+            nan_close=None,
+            dilated=None,
+            edge_interpolation=None,
+        )
+        difference_top_variants = RasterVariants(
+            original=difference_upper_npim,
+            nan_close=None,
+            dilated=None,
+            edge_interpolation=interp_npim,
+        )
+        difference_bottom_variants = RasterVariants(
+            original=difference_lower_npim,
+            nan_close=None,
+            dilated=None,
+            edge_interpolation=None,
+        )
+
+        bottom_floor_elev = (
+            config.bottom_floor_elev
+            if config.bottom_floor_elev is not None
+            else shared_min_elev - 1
+        )
+
+        # Prepare the difference raster first so the normal hint covers the
+        # exact footprint where the difference mesh will emit cells.
+        if config.edge_clipping_polygon:
+            print("Finding difference polygon clipping edges")
+            find_polygon_clipping_edges(
+                config=difference_config,
+                dem=upper_dem,
+                surface_raster_variant=[
+                    difference_top_variants,
+                    difference_bottom_variants,
+                ],
+                top_hint=None,
+                print3D_resolution_mm=print3D_resolution_mm,
+            )
+
+        if (
+            raster_preparation(
+                top=difference_top_variants,
+                bottom=difference_bottom_variants,
+                top_hint=None,
+                bottom_thru_base=difference_config.bottom_thru_base,
+                bottom_floor_elev=bottom_floor_elev,
+            )
+            is False
+            or difference_top_variants.dilated is None
+        ):
+            raise RuntimeError("Difference pair raster preparation failed.")
+
+        if config.edge_clipping_polygon:
+            print("Marking difference shared edges for walls")
+            mark_shared_edges_for_walls(
+                polygon_intersection_edge_buckets=(
+                    difference_top_variants.polygon_intersection_edge_buckets
+                ),
+                elevation_raster=difference_top_variants.dilated,
+                direction=(-1, -1),
+            )
+
+        if config.clean_diags:
+            difference_top_variants.apply_closure_to_variants(clean_up_diags)
+            difference_bottom_variants.apply_closure_to_variants(
+                clean_up_diags,
+            )
+
+        normal_top_hint_npim = difference_top_variants.dilated.copy()
+
+        if config.edge_clipping_polygon:
+            print("Finding normal polygon clipping edges")
+            find_polygon_clipping_edges(
+                config=normal_config,
+                dem=lower_dem,
+                surface_raster_variant=[
+                    normal_top_variants,
+                    normal_bottom_variants,
+                ],
+                top_hint=normal_top_hint_npim,
+                print3D_resolution_mm=print3D_resolution_mm,
+            )
+
+        if (
+            raster_preparation(
+                top=normal_top_variants,
+                bottom=normal_bottom_variants,
+                top_hint=normal_top_hint_npim,
+                bottom_thru_base=normal_config.bottom_thru_base,
+                bottom_floor_elev=bottom_floor_elev,
+            )
+            is False
+            or normal_top_variants.dilated is None
+        ):
+            raise RuntimeError("Normal pair raster preparation failed.")
+
+        if config.clean_diags:
+            normal_top_variants.apply_closure_to_variants(clean_up_diags)
+            normal_bottom_variants.apply_closure_to_variants(clean_up_diags)
+
+        if config.edge_clipping_polygon:
+            print("Marking normal shared edges for walls")
+            mark_shared_edges_for_walls(
+                polygon_intersection_edge_buckets=(
+                    normal_top_variants.polygon_intersection_edge_buckets
+                ),
+                elevation_raster=normal_top_variants.dilated,
+                direction=(-1, -1),
+            )
+
+        min_bottom_elev = None
+        if difference_bottom_variants.dilated is not None:
+            min_bottom_elev = numpy.nanmin(difference_bottom_variants.dilated)
+
+        pr(
+            "normal elev min/max:",
+            f"{normal_config.min_elev:.2f}",
+            "to",
+            f"{numpy.nanmax(normal_top_variants.dilated):.2f}",
+        )
+        pr(
+            "difference elev min/max:",
+            f"{difference_config.min_elev:.2f}",
+            "to",
+            f"{numpy.nanmax(difference_top_variants.dilated):.2f}",
+        )
+
+        def pad_1x1(raster: numpy.ndarray) -> numpy.ndarray:
+            """Pad one raster cell on all sides using edge values."""
+            return numpy.pad(raster, (1, 1), "edge")
+
+        normal_top_variants.apply_closure_to_variants(pad_1x1)
+        normal_bottom_variants.apply_closure_to_variants(pad_1x1)
+        difference_top_variants.apply_closure_to_variants(pad_1x1)
+        difference_bottom_variants.apply_closure_to_variants(pad_1x1)
+
+        full_raster_height, full_raster_width = (
+            difference_top_variants.dilated.shape
+        )
+        cells_per_tile_x = int(full_raster_width / num_tiles[0])
+        cells_per_tile_y = int(full_raster_height / num_tiles[1])
+        pr("Cells per tile (x/y)", cells_per_tile_x, "x", cells_per_tile_y)
+
+        def make_base_tile_info(
+            tile_config: TouchTerrainConfig,
+        ) -> TouchTerrainTileInfo:
+            """Create shared tile metadata for one pair role."""
+            tile_info = TouchTerrainTileInfo(config=tile_config)
+            tile_info.crs = upper_proj
+            tile_info.scale = print3D_scale_number
+            tile_info.pixel_mm = print3D_resolution_mm
+            tile_info.min_bot_elev = min_bottom_elev
+            tile_info.folder_name = pair_base_name
+            tile_info.tile_width = print3D_width_per_tile
+            tile_info.tile_height = print3D_height_per_tile
+            tile_info.geo_transform = geo_transform
+            tile_info.full_raster_height = full_raster_height
+            tile_info.full_raster_width = full_raster_width
+            tile_info.temp_file = None
+            return tile_info
+
+        normal_base_tile_info = make_base_tile_info(normal_config)
+        difference_base_tile_info = make_base_tile_info(difference_config)
+
+        selected_tiles: list[tuple[int, int]] = []
+        for tx in range(num_tiles[0]):
+            for ty in range(num_tiles[1]):
+                if config.only is None:
+                    selected_tiles.append((tx, ty))
+                elif config.only == [tx + 1, ty + 1]:
+                    selected_tiles.append((tx, ty))
+                else:
+                    print(
+                        "process only is:",
+                        config.only,
+                        ", skipping tile",
+                        tx + 1,
+                        ty + 1,
+                    )
+
+        def fill_missing_raster_bottoms(
+            bottom_variants: RasterVariants,
+            emit_raster: numpy.ndarray,
+            bottom_provider: BottomSurfaceProvider,
+        ) -> None:
+            """Patch tile-local raster bottoms when no normal surface exists."""
+            if bottom_variants.original is None:
+                raise RuntimeError(
+                    "Interlocking pair difference fallback bottom raster is "
+                    "missing."
+                )
+
+            for row_index, provider_row in enumerate(bottom_provider):
+                raster_y = row_index + 1
+                for col_index, provider_surface in enumerate(provider_row):
+                    surface_quad, surface_polygons = provider_surface
+                    if surface_quad is not None or surface_polygons is not None:
+                        continue
+
+                    raster_x = col_index + 1
+                    if numpy.isnan(emit_raster[raster_y, raster_x]):
+                        continue
+
+                    bottom_variants.set_location_in_variants(
+                        (raster_y, raster_x),
+                        bottom_floor_elev,
+                    )
+
+        total_mesh_size_mb = 0.0
+        with ZipFile(final_zip_file_name, "w", allowZip64=True) as output_zip:
+            for tx, ty in selected_tiles:
+                start_x = tx * cells_per_tile_x
+                end_x = start_x + cells_per_tile_x + 1 + 1
+                start_y = ty * cells_per_tile_y
+                end_y = start_y + cells_per_tile_y + 1 + 1
+
+                tile_normal_top = normal_top_variants.copy_tile_raster_variants(
+                    start_y,
+                    end_y,
+                    start_x,
+                    end_x,
+                )
+                tile_normal_bottom = (
+                    normal_bottom_variants.copy_tile_raster_variants(
+                        start_y,
+                        end_y,
+                        start_x,
+                        end_x,
+                    )
+                )
+                tile_difference_top = (
+                    difference_top_variants.copy_tile_raster_variants(
+                        start_y,
+                        end_y,
+                        start_x,
+                        end_x,
+                    )
+                )
+                tile_difference_bottom = (
+                    difference_bottom_variants.copy_tile_raster_variants(
+                        start_y,
+                        end_y,
+                        start_x,
+                        end_x,
+                    )
+                )
+
+                normal_tile_info = copy.deepcopy(normal_base_tile_info)
+                normal_tile_info.tile_no_x = tx + 1
+                normal_tile_info.tile_no_y = ty + 1
+                normal_tile = ProcessingTile(
+                    tile_info=normal_tile_info,
+                    top=tile_normal_top,
+                    bottom=tile_normal_bottom,
+                    return_grid=True,
+                )
+                normal_result = process_tile(normal_tile)
+                normal_processed_info, normal_buffer, normal_grid = (
+                    normal_result
+                )
+                if normal_buffer is None:
+                    raise RuntimeError(
+                        "Interlocking pair normal tile generated no mesh "
+                        f"for tile {tx + 1}, {ty + 1}."
+                    )
+
+                bottom_surface_provider = (
+                    normal_grid.extract_emitted_top_bottom_surfaces()
+                )
+                difference_emit_raster = tile_difference_top.dilated
+                if (
+                    difference_config.bottom_thru_base
+                    and tile_difference_bottom.nan_close is not None
+                ):
+                    difference_emit_raster = tile_difference_bottom.nan_close
+                if difference_emit_raster is None:
+                    raise RuntimeError(
+                        "Interlocking pair difference emit raster is missing."
+                    )
+                fill_missing_raster_bottoms(
+                    tile_difference_bottom,
+                    difference_emit_raster,
+                    bottom_surface_provider,
+                )
+
+                difference_tile_info = copy.deepcopy(
+                    difference_base_tile_info,
+                )
+                difference_tile_info.tile_no_x = tx + 1
+                difference_tile_info.tile_no_y = ty + 1
+                difference_tile = ProcessingTile(
+                    tile_info=difference_tile_info,
+                    top=tile_difference_top,
+                    bottom=tile_difference_bottom,
+                    bottom_surface_provider=bottom_surface_provider,
+                )
+                difference_processed_info, difference_buffer = process_tile(
+                    difference_tile,
+                )
+                if difference_buffer is None:
+                    raise RuntimeError(
+                        "Interlocking pair difference tile generated no mesh "
+                        f"for tile {tx + 1}, {ty + 1}."
+                    )
+
+                tile_suffix = (
+                    f"_tile_{tx + 1}_{ty + 1}"
+                    if len(selected_tiles) > 1
+                    else ""
+                )
+                extension = config.fileformat[:3]
+                output_zip.writestr(
+                    f"{pair_base_name}_normal{tile_suffix}.{extension}",
+                    normal_buffer,
+                )
+                output_zip.writestr(
+                    f"{pair_base_name}_difference{tile_suffix}.{extension}",
+                    difference_buffer,
+                )
+                total_mesh_size_mb += normal_processed_info.file_size
+                total_mesh_size_mb += difference_processed_info.file_size
+                pr(
+                    "tile",
+                    tx + 1,
+                    ty + 1,
+                    "normal size:",
+                    round(normal_processed_info.file_size, 3),
+                    "Mb, difference size:",
+                    round(difference_processed_info.file_size, 3),
+                    "Mb",
+                )
+
+            pr("\ntotal size for all pair meshes:", round(total_mesh_size_mb, 1), "Mb")
+            pr("\nprocessing finished: " + datetime.datetime.now().time().isoformat())
+            log_file_handler.flush()
+            output_zip.write(log_file_name, "logfile.txt")
+
+        del upper_band
+        del lower_band
+        upper_dem = None
+        lower_dem = None
+        return total_mesh_size_mb, final_zip_file_name
+    finally:
+        log_file_handler.close()
+        logger.removeHandler(log_file_handler)
+        try:
+            os.remove(log_file_name)
+        except Exception as exc:
+            logger.error("Error removing logfile %s %s", log_file_name, exc)
 
 
 def get_zipped_tiles(user_dict: dict[str, Any]):
@@ -937,7 +1606,6 @@ def get_zipped_tiles(user_dict: dict[str, Any]):
 
     if config.interlocking_mesh_pair:
         return _get_interlocking_pair_zipped_tiles(
-            user_dict=user_dict,
             config=config,
         )
 
