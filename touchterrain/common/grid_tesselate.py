@@ -75,6 +75,7 @@ EmittedBottomSurface: TypeAlias = tuple[
     list[shapely.Polygon] | None,
 ]
 BottomSurfaceProvider: TypeAlias = list[list[EmittedBottomSurface]]
+MESH_OUTPUT_DECIMAL_PRECISION = 6
 
 
 def edge_xy_signature(coord0: Coordinate, coord1: Coordinate) -> XYEdge:
@@ -125,6 +126,112 @@ def boundary_edge_map_from_meshes(
         for footprint, coords in edge_coords.items()
         if edge_counts[footprint] == 1
     }
+
+
+def mesh_output_coordinate(
+    value: float,
+    fileformat: str,
+    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+) -> float:
+    """Return the coordinate signature used for STL merge detection."""
+    if fileformat == "STLb":
+        value = (
+            struct.unpack(
+                "<f",
+                struct.pack("<f", value),
+            )[0]
+            + 0.0
+        )
+    return round(value, decimals) + 0.0
+
+
+def mesh_output_signature(
+    coord: Coordinate,
+    fileformat: str,
+    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+) -> tuple[float, ...]:
+    """Return a coordinate key using the current mesh output precision."""
+    return tuple(
+        mesh_output_coordinate(
+            value=value,
+            fileformat=fileformat,
+            decimals=decimals,
+        )
+        for value in coord[:3]
+    )
+
+
+def triangle_collapses_after_mesh_output(
+    triangle: Sequence[Coordinate],
+    fileformat: str,
+    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+) -> bool:
+    """Return whether a triangle is degenerate after mesh serialization."""
+    p0, p1, p2 = [
+        mesh_output_signature(
+            coord=coord,
+            fileformat=fileformat,
+            decimals=decimals,
+        )
+        for coord in triangle
+    ]
+    if len({p0, p1, p2}) < 3:
+        return True
+
+    a = (
+        p1[0] - p0[0],
+        p1[1] - p0[1],
+        p1[2] - p0[2],
+    )
+    b = (
+        p2[0] - p0[0],
+        p2[1] - p0[1],
+        p2[2] - p0[2],
+    )
+    cross = (
+        round(a[1] * b[2] - a[2] * b[1], 12),
+        round(a[2] * b[0] - a[0] * b[2], 12),
+        round(a[0] * b[1] - a[1] * b[0], 12),
+    )
+    return cross == (0.0, 0.0, 0.0)
+
+
+def polygon_prepared_for_mesh_output(
+    polygon: shapely.Polygon,
+    fileformat: str,
+    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+) -> shapely.Polygon | None:
+    """Return a snapped triangle polygon, or None if it collapses."""
+    coords = list(polygon.exterior.coords)
+    if len(coords) != 4 or coords[0] != coords[-1]:
+        raise ValueError("Expected a closed triangular Polygon.")
+
+    exterior = [
+        mesh_output_signature(
+            coord=coord,
+            fileformat=fileformat,
+            decimals=decimals,
+        )
+        for coord in polygon.exterior.coords
+    ]
+    interiors = [
+        [
+            mesh_output_signature(
+                coord=coord,
+                fileformat=fileformat,
+                decimals=decimals,
+            )
+            for coord in ring.coords
+        ]
+        for ring in polygon.interiors
+    ]
+    if triangle_collapses_after_mesh_output(
+        triangle=exterior[:3],
+        fileformat=fileformat,
+        decimals=decimals,
+    ):
+        return None
+    return shapely.Polygon(exterior, interiors)
 
 
 # function to calculate the normal for a triangle
@@ -189,6 +296,59 @@ def make_wall_without_exact_duplicate_vertices(
     )
 
 
+def quad_prepared_for_mesh_output(
+    mesh: quad,
+    fileformat: str,
+    split_rotation: int,
+) -> quad | None:
+    """Return a quad or triangle after snapping output-close vertices."""
+    unique_vertices: list[vertex] = []
+    for mesh_vertex in mesh.vl:
+        if mesh_vertex is None:
+            continue
+
+        output_vertex = vertex(
+            *mesh_output_signature(mesh_vertex.coords, fileformat),
+        )
+        if not any(
+            output_vertex.coords == existing.coords
+            for existing in unique_vertices
+        ):
+            unique_vertices.append(output_vertex)
+
+    if len(unique_vertices) < 3:
+        return None
+
+    if len(unique_vertices) == 3:
+        if triangle_collapses_after_mesh_output(
+            triangle=[v.coords for v in unique_vertices],
+            fileformat=fileformat,
+        ):
+            return None
+        return quad(unique_vertices[0], unique_vertices[1], unique_vertices[2])
+
+    output_quad = quad(
+        unique_vertices[0],
+        unique_vertices[1],
+        unique_vertices[2],
+        unique_vertices[3],
+    )
+    valid_triangles: list[tuple[vertex, ...]] = []
+    for triangle in output_quad.get_triangles(split_rotation=split_rotation):
+        if not triangle_collapses_after_mesh_output(
+            triangle=[v.coords for v in triangle],
+            fileformat=fileformat,
+        ):
+            valid_triangles.append(triangle)
+
+    if len(valid_triangles) == 2:
+        return output_quad
+    if len(valid_triangles) == 1:
+        triangle = valid_triangles[0]
+        return quad(triangle[0], triangle[1], triangle[2])
+    return None
+
+
 class cell:
     '''a cell with a top and bottom quad, constructor: uses refs and does NOT copy ...
        except for triangle cells
@@ -245,6 +405,55 @@ class cell:
 
         return meshes
 
+    def remove_close_geometry_mesh_output_collapsed(
+        self,
+        output_fileformat: str,
+        split_rotation: int,
+    ) -> None:
+        """Remove cell meshes whose vertices merge at output precision."""
+        if self.topquad is not None:
+            self.topquad = quad_prepared_for_mesh_output(
+                self.topquad,
+                output_fileformat,
+                split_rotation,
+            )
+
+        if self.bottomquad is not None:
+            self.bottomquad = quad_prepared_for_mesh_output(
+                self.bottomquad,
+                output_fileformat,
+                split_rotation,
+            )
+
+        for direction, border in self.borders.items():
+            if border is not False:
+                self.borders[direction] = (
+                    quad_prepared_for_mesh_output(
+                        border,
+                        output_fileformat,
+                        split_rotation,
+                    ) or False
+                )
+
+        if self.surfacePolygonBorders:
+            surface_borders = []
+            for surface_border in self.surfacePolygonBorders:
+                output_border = quad_prepared_for_mesh_output(
+                    surface_border,
+                    output_fileformat,
+                    split_rotation,
+                )
+                if output_border is not None:
+                    surface_borders.append(output_border)
+            self.surfacePolygonBorders = surface_borders or None
+
+        if self.topquad is None and not self.topSurfacePolygons:
+            self.bottomquad = None
+            self.bottomSurfacePolygons = None
+            self.surfacePolygonBorders = None
+            for direction in self.borders:
+                self.borders[direction] = False
+
     def emitted_top_as_bottom_surfaces(
         self,
     ) -> EmittedBottomSurface:
@@ -280,6 +489,7 @@ class cell:
         bottom_surface_polygons: list[shapely.Polygon] | None,
         zero_height_tolerance: float,
         split_rotation: int,
+        output_fileformat: str | None = None,
     ) -> None:
         """Replace bottom geometry and rebuild walls against the current top.
 
@@ -294,6 +504,7 @@ class cell:
             bottom_planes = bottom_surface_quad.get_triangles_in_polygons(
                 split_rotation=split_rotation,
             )
+            kept_top_surface_polygons: list[shapely.Polygon] = []
             for top_polygon in self.topSurfacePolygons:
                 bottom_polygon = interpolate_z_planar(
                     geometry_2d=shapely.orient_polygons(
@@ -307,7 +518,23 @@ class cell:
                         "Shared pair clipped bottom interpolation did not "
                         "return a Polygon."
                     )
+                if output_fileformat is not None:
+                    bottom_polygon = polygon_prepared_for_mesh_output(
+                        bottom_polygon,
+                        output_fileformat,
+                    )
+                    if bottom_polygon is None:
+                        continue
+                kept_top_surface_polygons.append(top_polygon)
                 bottom_surface_polygons.append(bottom_polygon)
+            self.topSurfacePolygons = kept_top_surface_polygons
+            if not bottom_surface_polygons:
+                self.topquad = None
+                self.bottomquad = None
+                self.bottomSurfacePolygons = None
+                self.surfacePolygonBorders = None
+                self.borders = {drct: False for drct in ["N", "S", "E", "W"]}
+                return
             bottom_surface_quad = None
 
         if bottom_surface_polygons is not None:
@@ -923,37 +1150,64 @@ class ProcessingTile:
         self.bottom_surface_provider = bottom_surface_provider
         self.return_grid = return_grid
    
-def interpolate_with_NaN(elev: np.ndarray, i, j) -> tuple[float|None, float|None, float|None, float|None]:
-    '''Get elevation of 4 corners of current cell and return them as NEelev, NWelev, SEelev, SWelev
-    If any of the corners is NaN, return None for all 4 corners'''
+def interpolate_corner_with_canonical_order(
+    elev: np.ndarray,
+    top_left_row: int,
+    top_left_col: int,
+) -> float:
+    """Return a corner average from a canonical 2x2 operand order."""
+    top_left = elev[top_left_row, top_left_col]
+    top_right = elev[top_left_row, top_left_col + 1]
+    bottom_left = elev[top_left_row + 1, top_left_col]
+    bottom_right = elev[top_left_row + 1, top_left_col + 1]
 
-    # interpolate each corner with possible NaNs, using mean()
-    # Note: if we have 1 or more NaNs, we get a warning: warnings.warn("Mean of empty slice", RuntimeWarning)
-    # but if the result of ANY corner is NaN (b/c it used 4 NaNs), skip this cell entirely by setting it to None instead a cell object
+    if (
+        np.isnan(top_left)
+        or np.isnan(top_right)
+        or np.isnan(bottom_left)
+        or np.isnan(bottom_right)
+    ):
+        return np.nanmean(
+            np.array(
+                [top_left, top_right, bottom_left, bottom_right],
+                dtype=np.float64,
+            ),
+        )
+
+    return (top_left + top_right + bottom_left + bottom_right) / 4.0
+
+
+def interpolate_with_NaN(
+    elev: np.ndarray,
+    i: int,
+    j: int,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Return NE, NW, SE, and SW cell corner elevations.
+
+    The same shared raster corner is always averaged in the same operand order
+    so adjacent cells produce identical floating-point values before mesh
+    serialization.
+    """
+
+    # Interpolate each corner with possible NaNs. If any corner is surrounded
+    # by all NaNs, skip the whole cell.
     with warnings.catch_warnings():
         warnings.filterwarnings('error')
-        NEar = np.array([elev[j+0,i+0], elev[j-1,i-0], elev[j-1,i+1], elev[j-0,i+1]]).astype(np.float64)
-        NWar = np.array([elev[j+0,i+0], elev[j+0,i-1], elev[j-1,i-1], elev[j-1,i+0]]).astype(np.float64)
-        SEar = np.array([elev[j+0,i+0], elev[j-0,i+1], elev[j+1,i+1], elev[j+1,i+0]]).astype(np.float64)
-        SWar = np.array([elev[j+0,i+0], elev[j+1,i+0], elev[j+1,i-1], elev[j+0,i-1]]).astype(np.float64)
 
-        try: 
+        try:
             # init all elevs with NaN
             NEelev = NWelev = SEelev = SWelev = np.nan
 
-            # nanmean() is expensive, so only use it when actually needed
-            # if any of the interp sources are < basethick, leave the corner height as the cell height
-            NEelev = np.nanmean(NEar) if np.isnan(np.sum(NEar)) else (elev[j+0,i+0] + elev[j-1,i-0] + elev[j-1,i+1] + elev[j-0,i+1]) / 4.0
-            NWelev = np.nanmean(NWar) if np.isnan(np.sum(NWar)) else (elev[j+0,i+0] + elev[j+0,i-1] + elev[j-1,i-1] + elev[j-1,i+0]) / 4.0
-            SEelev = np.nanmean(SEar) if np.isnan(np.sum(SEar)) else (elev[j+0,i+0] + elev[j-0,i+1] + elev[j+1,i+1] + elev[j+1,i+0]) / 4.0
-            SWelev = np.nanmean(SWar) if np.isnan(np.sum(SWar)) else (elev[j+0,i+0] + elev[j+1,i+0] + elev[j+1,i-1] + elev[j+0,i-1]) / 4.0
+            NEelev = interpolate_corner_with_canonical_order(elev, j - 1, i)
+            NWelev = interpolate_corner_with_canonical_order(elev, j - 1, i - 1)
+            SEelev = interpolate_corner_with_canonical_order(elev, j, i)
+            SWelev = interpolate_corner_with_canonical_order(elev, j, i - 1)
 
-        except RuntimeWarning: #  corner is surrounded by NaN elevations - skip this cell
-            #print(j-1, i-1, ": elevation of at least one corner of this cell is NaN - skipping cell")
-            #print " NW",NWelev," NE", NEelev, " SE", SEelev, " SW", SWelev # DEBUG
-            num_nans = sum(np.isnan(np.array([NEelev, NWelev, SEelev, SWelev]))) # is ANY of the corners NaN?
-            if num_nans > 0: # yes, set cell to None and skip it ...
-                # self.cells[j-1, i-1] = None # I commented this out since I have moved interpolate_with_NaN() out of grid class. Not sure what this part does if we return None for the 4 corners already?? -Anson
+        except RuntimeWarning:  # corner is surrounded by NaN elevations
+            num_nans = sum(
+                np.isnan(np.array([NEelev, NWelev, SEelev, SWelev])),
+            )
+            if num_nans > 0:  # yes, set cell to None and skip it
                 return None, None, None, None
         else:
             
@@ -1232,6 +1486,7 @@ class grid:
         pc_step = int(self.ymaxidx/percent) + 1
         progress = 0
         print("creating internal triangle data structure for", multiprocessing.current_process(), file=sys.stderr)
+        output_fileformat = self.tile_info.config.fileformat
 
         for j in range(1, self.ymaxidx+1):# y dimension for looping within the +1 padded raster
             if j % pc_step == 0:
@@ -1278,10 +1533,26 @@ class grid:
                 if not self.tile_info.have_nan:
                     interpolation_top_raster = self.tile.top_raster_variants.dilated
                     # non NaNs: interpolate elevation of four corners (array order is top[y,x]!)
-                    NEelev = (interpolation_top_raster[j+0,i+0] + interpolation_top_raster[j-1,i-0] + interpolation_top_raster[j-1,i+1] + interpolation_top_raster[j-0,i+1]) / 4.0
-                    NWelev = (interpolation_top_raster[j+0,i+0] + interpolation_top_raster[j+0,i-1] + interpolation_top_raster[j-1,i-1] + interpolation_top_raster[j-1,i+0]) / 4.0
-                    SEelev = (interpolation_top_raster[j+0,i+0] + interpolation_top_raster[j-0,i+1] + interpolation_top_raster[j+1,i+1] + interpolation_top_raster[j+1,i+0]) / 4.0
-                    SWelev = (interpolation_top_raster[j+0,i+0] + interpolation_top_raster[j+1,i+0] + interpolation_top_raster[j+1,i-1] + interpolation_top_raster[j+0,i-1]) / 4.0
+                    NEelev = interpolate_corner_with_canonical_order(
+                        interpolation_top_raster,
+                        j - 1,
+                        i,
+                    )
+                    NWelev = interpolate_corner_with_canonical_order(
+                        interpolation_top_raster,
+                        j - 1,
+                        i - 1,
+                    )
+                    SEelev = interpolate_corner_with_canonical_order(
+                        interpolation_top_raster,
+                        j,
+                        i,
+                    )
+                    SWelev = interpolate_corner_with_canonical_order(
+                        interpolation_top_raster,
+                        j,
+                        i - 1,
+                    )
                 else:
                     # NaNs: set borders to True if we have any NaNs in any of the adjacent cells
                     # Do this only for top as we assume that any bottom raster NaNs are the same as on top
@@ -1340,7 +1611,10 @@ class grid:
                 top_bottom_surface_geometries_2D: list[shapely.Geometry] | None = None
                 top_bottom_surface_polygons_triangulated_2D: list[shapely.GeometryCollection] | None = None # tris for top and bottom surfaces
                 # Check if non-quad top_surface polygon should be used
-                top_surface_polygons_triangulated_3D: list[shapely.Polygon] | None = None
+                top_surface_polygons_triangulated_3D: (
+                    list[shapely.Polygon | None] | None
+                ) = None
+                clipped_surfaces_collapsed_after_output = False
                 # by checking if the cell is NOT contains_properly and if it has polygon_intersection_geometry
                 if (self.tile.top_raster_variants.polygon_intersection_contains_properly is not None and self.tile.top_raster_variants.polygon_intersection_contains_properly[j-1][i-1] == False) and self.tile.top_raster_variants.polygon_intersection_geometry is not None:
                     top_bottom_surface_polygons_triangulated_2D = []
@@ -1360,7 +1634,12 @@ class grid:
                                 tri_with_z = interpolate_z_planar(geometry_2d=tri_ccw_order, planes_3d=topq.get_triangles_in_polygons(split_rotation=self.tile_info.config.split_rotation))
                                 #tri_with_z = interpolate_geometry_with_quad(geometry=tri_ccw_order, quad=topq, split_rotation=self.tile_info.config.split_rotation)
                                 if isinstance(tri_with_z, shapely.Polygon):
-                                    top_surface_polygons_triangulated_3D.append(tri_with_z)
+                                    top_surface_polygons_triangulated_3D.append(
+                                        polygon_prepared_for_mesh_output(
+                                            tri_with_z,
+                                            output_fileformat,
+                                        )
+                                    )
                                 else:
                                     raise ValueError(f"tri_with_z is not Polygon, it is {type(tri_with_z)}")
                 
@@ -1382,10 +1661,29 @@ class grid:
                     else:
                         # simple interpolation
                         if not self.tile_info.have_bot_nan:
-                            NEelev = (self.tile.bottom_raster_variants.dilated[j+0,i+0] + self.tile.bottom_raster_variants.dilated[j-1,i-0] + self.tile.bottom_raster_variants.dilated[j-1,i+1] + self.tile.bottom_raster_variants.dilated[j-0,i+1]) / 4.0
-                            NWelev = (self.tile.bottom_raster_variants.dilated[j+0,i+0] + self.tile.bottom_raster_variants.dilated[j+0,i-1] + self.tile.bottom_raster_variants.dilated[j-1,i-1] + self.tile.bottom_raster_variants.dilated[j-1,i+0]) / 4.0
-                            SEelev = (self.tile.bottom_raster_variants.dilated[j+0,i+0] + self.tile.bottom_raster_variants.dilated[j-0,i+1] + self.tile.bottom_raster_variants.dilated[j+1,i+1] + self.tile.bottom_raster_variants.dilated[j+1,i+0]) / 4.0
-                            SWelev = (self.tile.bottom_raster_variants.dilated[j+0,i+0] + self.tile.bottom_raster_variants.dilated[j+1,i+0] + self.tile.bottom_raster_variants.dilated[j+1,i-1] + self.tile.bottom_raster_variants.dilated[j+0,i-1]) / 4.0
+                            bottom_raster = (
+                                self.tile.bottom_raster_variants.dilated
+                            )
+                            NEelev = interpolate_corner_with_canonical_order(
+                                bottom_raster,
+                                j - 1,
+                                i,
+                            )
+                            NWelev = interpolate_corner_with_canonical_order(
+                                bottom_raster,
+                                j - 1,
+                                i - 1,
+                            )
+                            SEelev = interpolate_corner_with_canonical_order(
+                                bottom_raster,
+                                j,
+                                i,
+                            )
+                            SWelev = interpolate_corner_with_canonical_order(
+                                bottom_raster,
+                                j,
+                                i - 1,
+                            )
                         else:
                             # Nan aware interpolation 
                             NEelev, NWelev, SEelev, SWelev = interpolate_with_NaN(self.tile.bottom_raster_variants.original, i, j)
@@ -1418,7 +1716,9 @@ class grid:
                 botq = quad(NWb, NEb, SEb, SWb)
 
                 # Check if non-quad top_surface polygon should be used for bottom quad
-                bottom_surface_polygons_triangulated_3D: list[shapely.Polygon] | None = None
+                bottom_surface_polygons_triangulated_3D: (
+                    list[shapely.Polygon | None] | None
+                ) = None
                 if top_bottom_surface_polygons_triangulated_2D is not None:
                     # We can verify if our shapely utils coordinate converter matches the N W S E made in create_cells. (it does if you adjust for the padding difference)
                     #quadPrint2DCoords = utils.arrayCellCoordToQuadPrint2DCoords(array_coord_2D=(i-1,j-1), cell_size=self.cell_size, tile_y_shape=self.tile.top_raster_variants.polygon_intersection_geometry.shape[0])
@@ -1430,19 +1730,60 @@ class grid:
                             tri_cw_order = shapely.orient_polygons(tri, exterior_cw=True)
                             tri_with_z = interpolate_z_planar(geometry_2d=tri_cw_order, planes_3d=botq.get_triangles_in_polygons(split_rotation=self.tile_info.config.split_rotation))
                             if isinstance(tri_with_z, shapely.Polygon):
-                                bottom_surface_polygons_triangulated_3D.append(tri_with_z)
+                                bottom_surface_polygons_triangulated_3D.append(
+                                    polygon_prepared_for_mesh_output(
+                                        tri_with_z,
+                                        output_fileformat,
+                                    )
+                                )
                             else:
                                 raise TypeError('tri_with_z is not Polygon. interpolate_z_planar did not return the same Polygon type passed in')
-                
+
+                    if top_surface_polygons_triangulated_3D is not None:
+                        if len(top_surface_polygons_triangulated_3D) != len(
+                            bottom_surface_polygons_triangulated_3D
+                        ):
+                            raise RuntimeError(
+                                "Top and bottom clipped surface triangle "
+                                "counts differ during output cleanup."
+                            )
+
+                        original_polygon_count = len(
+                            top_surface_polygons_triangulated_3D
+                        )
+                        kept_top_polygons: list[shapely.Polygon] = []
+                        kept_bottom_polygons: list[shapely.Polygon] = []
+                        for top_polygon, bottom_polygon in zip(
+                            top_surface_polygons_triangulated_3D,
+                            bottom_surface_polygons_triangulated_3D,
+                        ):
+                            if top_polygon is None or bottom_polygon is None:
+                                continue
+                            kept_top_polygons.append(top_polygon)
+                            kept_bottom_polygons.append(bottom_polygon)
+
+                        if original_polygon_count and not kept_top_polygons:
+                            clipped_surfaces_collapsed_after_output = True
+
+                        top_surface_polygons_triangulated_3D = (
+                            kept_top_polygons
+                        )
+                        bottom_surface_polygons_triangulated_3D = (
+                            kept_bottom_polygons
+                        )
+
                 #endregion
-                
+
                 #print(topq)
                 #print(botq)
-                 
+                if clipped_surfaces_collapsed_after_output:
+                    self.cells[j - 1, i - 1] = None
+                    continue
+
                 #
                 #region Make borders
                 #
-                
+
                 # Simple rectangular mesh case with no NaN
                 # Which directions will need to have a wall?
                 # True means: we have an adjacent cell and need a wall in that direction
@@ -1484,10 +1825,42 @@ class grid:
                             pass # nothing wrong - just here to ignore the warning
                     
                     # Quads for walls: in borders dict, replace any True with a quad of that wall
-                    if borders["N"] == True: borders["N"] = make_wall_without_exact_duplicate_vertices(NWb, NWt, NEt, NEb) or False
-                    if borders["S"] == True: borders["S"] = make_wall_without_exact_duplicate_vertices(SEb, SEt, SWt, SWb) or False
-                    if borders["E"] == True: borders["E"] = make_wall_without_exact_duplicate_vertices(NEt, SEt, SEb, NEb) or False
-                    if borders["W"] == True: borders["W"] = make_wall_without_exact_duplicate_vertices(SWt, NWt, NWb, SWb) or False
+                    if borders["N"] == True:
+                        borders["N"] = (
+                            make_wall_without_exact_duplicate_vertices(
+                                NWb,
+                                NWt,
+                                NEt,
+                                NEb,
+                            ) or False
+                        )
+                    if borders["S"] == True:
+                        borders["S"] = (
+                            make_wall_without_exact_duplicate_vertices(
+                                SEb,
+                                SEt,
+                                SWt,
+                                SWb,
+                            ) or False
+                        )
+                    if borders["E"] == True:
+                        borders["E"] = (
+                            make_wall_without_exact_duplicate_vertices(
+                                NEt,
+                                SEt,
+                                SEb,
+                                NEb,
+                            ) or False
+                        )
+                    if borders["W"] == True:
+                        borders["W"] = (
+                            make_wall_without_exact_duplicate_vertices(
+                                SWt,
+                                NWt,
+                                NWb,
+                                SWb,
+                            ) or False
+                        )
 
                 # create borders if there is a top surface polygon using the edge buckets
                 surface_polygon_borders_3D: list[quad] = []
@@ -1534,7 +1907,12 @@ class grid:
                                 top_edge_v1 = vertex(*topEdgeMatch.coords[0])
                                 bot_edge_v0 = vertex(*botEdgeMatch.coords[1])
                                 bot_edge_v1 = vertex(*botEdgeMatch.coords[0])
-                                tb_wall = make_wall_without_exact_duplicate_vertices(top_edge_v0, top_edge_v1, bot_edge_v0, bot_edge_v1)
+                                tb_wall = make_wall_without_exact_duplicate_vertices(
+                                    top_edge_v0,
+                                    top_edge_v1,
+                                    bot_edge_v0,
+                                    bot_edge_v1,
+                                )
                                 if tb_wall is not None:
                                     surface_polygon_borders_3D.append(tb_wall)
                                 pass
@@ -1595,6 +1973,7 @@ class grid:
                             split_rotation=(
                                 self.tile_info.config.split_rotation
                             ),
+                            output_fileformat=output_fileformat,
                         )
 
                 # DEBUG: store i,j, and central elev
@@ -1629,6 +2008,12 @@ class grid:
                     if c.check_for_tri_cell():
                         c.convert_to_tri_cell()
 
+                # Snap and remove close geometry that would be collapsed during mesh output (based on output format e.g. STL) in cell fields before doing more cell creation with them.
+                c.remove_close_geometry_mesh_output_collapsed(
+                    output_fileformat=output_fileformat,
+                    split_rotation=self.tile_info.config.split_rotation,
+                )
+
                 self.cells[j - 1, i - 1] = c
 
                 #endregion
@@ -1650,43 +2035,67 @@ class grid:
                 # for k in c.borders:  # k is N, S, E, W
                 #     if c.borders[k] is not False: meshes.append(c.borders[k])
                         
-                def triangle_rounded_to_precision(decimals: int, triangle: list[vertex]) -> list[vertex]:
+                def triangle_rounded_to_precision(
+                    decimals: int,
+                    triangle: list[vertex],
+                ) -> list[vertex]:
                     output: list[vertex] = []
                     for tv in triangle:
-                        output.append(tv.vertex_rounded_to_precision(decimals=decimals))
+                        output.append(
+                            tv.vertex_rounded_to_precision(
+                                decimals=decimals,
+                            )
+                        )
                     return output
-                   
-                decimal_precision = 6
-                
+
+                decimal_precision = MESH_OUTPUT_DECIMAL_PRECISION
+
                 # Debug: inspect cell
                 if j == 6 and i == 5:
                     pass
-                
+
                 # write the triangles of the meshes to buffer
                 for q in meshes:
-                    mesh_triangles: list[list[vertex]] = []                    
+                    mesh_triangles: list[list[vertex]] = []
                     if isinstance(q, quad):
-                        quad_triangles = q.get_triangles(split_rotation=self.tile_info.config.split_rotation) # tri vertices
+                        quad_triangles = q.get_triangles(
+                            split_rotation=(
+                                self.tile_info.config.split_rotation
+                            ),
+                        )
 
-                        # for STL this will write triangles (vertices) but for obj this will
-                        # write indices into s[1]/fo[1] (indices), vertices have to written based on these later 
+                        # For STL this writes triangle vertices. For OBJ it
+                        # writes indices into s[1]/fo[1].
                         for t in quad_triangles:
                             #mesh_triangles.append(list(t))
                             mesh_triangles.append(
-                                triangle_rounded_to_precision(decimals=decimal_precision, triangle=list(t))
+                                triangle_rounded_to_precision(
+                                    decimals=decimal_precision,
+                                    triangle=list(t),
                                 )
+                            )
                         # if any(t0):
                         #     self.write_triangle_to_buffer(t0)
-                        #     self.write_triangle_to_buffer(t1) # could be empty ...    
+                        #     self.write_triangle_to_buffer(t1) # could be empty ...
                     elif isinstance(q, shapely.Polygon):
                         pass
                         t0 = tuple(polygon_to_list_of_vertex(polygon=q))
                         if len(t0) == 4 and t0[0].coords == t0[3].coords:
                            #mesh_triangles.append(list(t0[:3]))
-                           mesh_triangles.append(triangle_rounded_to_precision(decimals=decimal_precision, triangle=list(t0[:3])))
+                           mesh_triangles.append(
+                               triangle_rounded_to_precision(
+                                   decimals=decimal_precision,
+                                   triangle=list(t0[:3]),
+                               )
+                           )
                         else:
-                           raise ValueError(f"create_cells: found a polygon to write to buffer that is not a triangle. Expected a tri of length 3+1=4 and [0]==[3] vertex. Polygon had vertex count f{len(t0)}.")
-                    
+                           raise ValueError(
+                               "create_cells: found a polygon to write to "
+                               "buffer that is not a triangle. Expected a "
+                               "tri of length 3+1=4 and [0]==[3] vertex. "
+                               f"Polygon had vertex count f{len(t0)}."
+                           )
+
                     for mt in mesh_triangles:
                         self.write_triangle_to_buffer(tuple(mt))
         
@@ -1719,8 +2128,33 @@ class grid:
             self.s.write(struct.pack(BINARY_FACET, *tl)) # append to s
 
         elif self.tile_info.config.fileformat == "STLa":
-            ASCII_FACET ="""facet normal {face[0]:f} {face[1]:f} {face[2]:f}\nouter loop\nvertex {face[3]:f} {face[4]:f} {face[5]:f}\nvertex {face[6]:f} {face[7]:f} {face[8]:f}\nvertex {face[9]:f} {face[10]:f} {face[11]:f}\nendloop\nendfacet\n"""
-            self.s.write(ASCII_FACET.format(face=tl))
+            ASCII_FACET = (
+                "facet normal "
+                "{face[0]:.{precision}f} "
+                "{face[1]:.{precision}f} "
+                "{face[2]:.{precision}f}\n"
+                "outer loop\n"
+                "vertex "
+                "{face[3]:.{precision}f} "
+                "{face[4]:.{precision}f} "
+                "{face[5]:.{precision}f}\n"
+                "vertex "
+                "{face[6]:.{precision}f} "
+                "{face[7]:.{precision}f} "
+                "{face[8]:.{precision}f}\n"
+                "vertex "
+                "{face[9]:.{precision}f} "
+                "{face[10]:.{precision}f} "
+                "{face[11]:.{precision}f}\n"
+                "endloop\n"
+                "endfacet\n"
+            )
+            self.s.write(
+                ASCII_FACET.format(
+                    face=tl,
+                    precision=MESH_OUTPUT_DECIMAL_PRECISION,
+                )
+            )
 
         elif self.tile_info.config.fileformat == "obj":
             # add facet indices to index stream buffer

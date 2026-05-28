@@ -51,3 +51,7 @@ Cell creation logic order:
 - Prefer minimal code changes has long as the code is self documenting and human readable.
   - Add concise comments for each major loop or step that is not immediately clear to a human what is being done.
 - Modified python code must conform to PEP 8, PEP 257, PEP 484
+
+## Prompt output to the developer
+
+- If referencing meshes, include a link to the mesh that is ready for manual inspection.
