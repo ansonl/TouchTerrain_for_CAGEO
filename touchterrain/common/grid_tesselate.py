@@ -772,26 +772,25 @@ class cell:
     
     def remove_zero_height_volumes(
         self,
+        split_rotation: int,
         output_fileformat: str = "STLb",
     ) -> None:
         """Remove zero-height cell geometry in place.
 
         This mutates quads, cardinal borders, clipped surface polygons, and
-        clipped wall borders. Matching clipped top/bottom polygons are deleted,
-        then ``surfacePolygonBorders`` is filtered or rebuilt so only walls
-        still supported by both remaining clipped-surface boundaries are kept.
+        clipped wall borders. Cardinal quads are compared as the triangles
+        emitted for ``split_rotation``. Matching clipped top/bottom polygons
+        are deleted, then ``surfacePolygonBorders`` is filtered or rebuilt so
+        only walls still supported by both remaining clipped-surface boundaries
+        are kept.
         """
-        # Local helpers normalize clipped surface boundaries and edge
-        # signatures to the coordinates emitted by the mesh writer.
+        # Step 1: compare at serialized mesh precision, not raw float
+        # precision, so cleanup matches the STL/OBJ vertices that are written.
         def output_signature(coord: Coordinate) -> tuple[float, ...]:
             return normalize_vertex_to_match_mesh_serialization(
                 coord,
                 output_fileformat,
             )
-
-        def same_output_coord(a: vertex, b: vertex) -> bool:
-            """Return True when vertices serialize to the same coordinate."""
-            return output_signature(a.coords) == output_signature(b.coords)
 
         def remaining_surface_boundary(
             surface_polygons: list[shapely.Polygon] | None,
@@ -930,70 +929,209 @@ class cell:
                 any(edge in bottom_edges for edge in non_vertical_edges)
             )
 
-        b = self.borders
-        tq = self.topquad.get_copy()
-        bq = self.bottomquad.get_copy()
-        tvl = tq.vl
-        bvl = bq.vl
-        
-        """Vertices mapping     NW SW SE NE
-        Top                      0  1  2  3
-        Bottom                   0  3  2  1
-        The vertices seem to be a different mapping than commented in convert_to_tri_cell() and the above mapping makes much more sense for normals' directions. This assumes we are viewing the quad from straight above from the positive Z direction.
-        """
-        
-        # First handle the cardinal quad cases, which have fixed corner order.
-        if (
-            same_output_coord(tvl[0], bvl[0])
-            and same_output_coord(tvl[1], bvl[3])
-            and same_output_coord(tvl[2], bvl[2])
-            and same_output_coord(tvl[3], bvl[1])
-        ):
-            self.topquad = None #quad(None, None, None, None)
-            self.bottomquad = None #quad(None, None, None, None)
-            b["N"] = b["W"] = b["S"] = b["E"] = False
-        # (NW case) NW NE SW vertices are same Z, keep tri of SE SW NE
-        elif (
-            same_output_coord(tvl[0], bvl[0])
-            and same_output_coord(tvl[3], bvl[1])
-            and same_output_coord(tvl[1], bvl[3])
-        ):
-            self.topquad = quad(tvl[3], tvl[1], tvl[2], None)
-            self.bottomquad = quad(bvl[1], bvl[2], bvl[3], None)
-            b["N"] = False #quad(tvl[1], tvl[3], bvl[1], bvl[3])
-            b["W"] = False
-        # (NE case) NW NE SE vertices are same Z, keep tri of SE SW NW
-        elif (
-            same_output_coord(tvl[0], bvl[0])
-            and same_output_coord(tvl[3], bvl[1])
-            and same_output_coord(tvl[2], bvl[2])
-        ):
-            self.topquad = quad(tvl[0], tvl[1], tvl[2], None)
-            self.bottomquad = quad(bvl[0], bvl[2], bvl[3], None)
-            b["N"] = False #quad(tvl[0], tvl[2], bvl[2], bvl[0])
-            b["E"] = False
-        # (SE case) NE SE SW vertices are same Z, keep tri of SW NW NE
-        elif (
-            same_output_coord(tvl[3], bvl[1])
-            and same_output_coord(tvl[1], bvl[3])
-            and same_output_coord(tvl[2], bvl[2])
-        ):
-            self.topquad = quad(tvl[3], tvl[0], tvl[1], None)
-            self.bottomquad = quad(bvl[3], bvl[0], bvl[1], None)
-            b["S"] = False #quad(tvl[3], tvl[1], bvl[3], bvl[1])
-            b["E"] = False
-        # (SW case) SE SW NW vertices are same Z, keep tri of NW NE SE
-        elif (
-            same_output_coord(tvl[0], bvl[0])
-            and same_output_coord(tvl[1], bvl[3])
-            and same_output_coord(tvl[2], bvl[2])
-        ):
-            self.topquad = quad(tvl[2], tvl[3], tvl[0], None)
-            self.bottomquad = quad(bvl[0], bvl[1], bvl[2], None)
-            b["S"] = False #quad(tvl[2], tvl[0], bvl[0], bvl[2])
-            b["W"] = False
+        # Step 2: cardinal quads are cleaned up using the triangles that will
+        # actually be emitted for the active split_rotation.
+        def triangle_signature(
+            triangle: tuple[vertex, ...],
+        ) -> tuple[tuple[float, ...], ...]:
+            """Return a serialized-coordinate triangle signature."""
+            # Sort vertices so opposite top/bottom winding still matches.
+            return tuple(
+                sorted(output_signature(v.coords) for v in triangle)
+            )
 
-        # Remove matching clipped-surface tris with the same Z at every vertex.
+        def triangle_boundary_footprints(
+            triangles: list[tuple[vertex, ...]],
+        ) -> set[XYEdge]:
+            """Return serialized XY boundary footprints for triangles."""
+            # Collect the serialized XY boundary edges still present.
+            footprints: set[XYEdge] = set()
+            for triangle in triangles:
+                for vi, v0 in enumerate(triangle):
+                    v1 = triangle[(vi + 1) % len(triangle)]
+                    footprints.add(edge_xy_signature(v0.coords, v1.coords))
+            return footprints
+
+        def filter_cardinal_borders(
+            top_triangles: list[tuple[vertex, ...]],
+            bottom_triangles: list[tuple[vertex, ...]],
+        ) -> None:
+            """Keep cardinal walls still supported by both surfaces."""
+            # After a cardinal surface triangle is removed, drop any N/S/E/W
+            # wall whose footprint is no longer present on both surfaces.
+            top_footprints = triangle_boundary_footprints(top_triangles)
+            bottom_footprints = triangle_boundary_footprints(bottom_triangles)
+            for direction, border in self.borders.items():
+                if border is False:
+                    continue
+                footprint = surface_border_footprint(border)
+                if footprint is None:
+                    self.borders[direction] = False
+                    continue
+                footprint_key = edge_xy_signature(
+                    footprint.coords[0],
+                    footprint.coords[1],
+                )
+                if (
+                    footprint_key not in top_footprints
+                    or footprint_key not in bottom_footprints
+                ):
+                    self.borders[direction] = False
+
+        def remove_matching_cardinal_corners() -> bool:
+            """Remove a zero-height corner when split diagonals differ."""
+            # This preserves the old 3-corner cleanup for cases where top and
+            # bottom choose different diagonals, so triangle signatures miss
+            # the zero-height corner.
+            if self.topquad is None or self.bottomquad is None:
+                return False
+            tvl = self.topquad.vl
+            bvl = self.bottomquad.vl
+            if tvl[3] is None or bvl[3] is None:
+                return False
+
+            # Corner index mapping by shared XY position:
+            #     position: NW  SW  SE  NE
+            #     top:       0   1   2   3
+            #     bottom:    0   3   2   1
+            corners_match = {
+                "NW": output_signature(tvl[0].coords)
+                == output_signature(bvl[0].coords),
+                "SW": output_signature(tvl[1].coords)
+                == output_signature(bvl[3].coords),
+                "SE": output_signature(tvl[2].coords)
+                == output_signature(bvl[2].coords),
+                "NE": output_signature(tvl[3].coords)
+                == output_signature(bvl[1].coords),
+            }
+
+            if all(corners_match.values()):
+                self.topquad = None
+                self.bottomquad = None
+                for direction in self.borders:
+                    self.borders[direction] = False
+                return True
+
+            if corners_match["NW"] and corners_match["NE"] and corners_match["SW"]:
+                self.topquad = quad(tvl[3], tvl[1], tvl[2], None)
+                self.bottomquad = quad(bvl[1], bvl[2], bvl[3], None)
+                self.borders["N"] = False
+                self.borders["W"] = False
+                return True
+
+            if corners_match["NW"] and corners_match["NE"] and corners_match["SE"]:
+                self.topquad = quad(tvl[0], tvl[1], tvl[2], None)
+                self.bottomquad = quad(bvl[0], bvl[2], bvl[3], None)
+                self.borders["N"] = False
+                self.borders["E"] = False
+                return True
+
+            if corners_match["NE"] and corners_match["SW"] and corners_match["SE"]:
+                self.topquad = quad(tvl[3], tvl[0], tvl[1], None)
+                self.bottomquad = quad(bvl[3], bvl[0], bvl[1], None)
+                self.borders["S"] = False
+                self.borders["E"] = False
+                return True
+
+            if corners_match["NW"] and corners_match["SW"] and corners_match["SE"]:
+                self.topquad = quad(tvl[2], tvl[3], tvl[0], None)
+                self.bottomquad = quad(bvl[0], bvl[1], bvl[2], None)
+                self.borders["S"] = False
+                self.borders["W"] = False
+                return True
+
+            return False
+
+        def remove_matching_cardinal_triangles() -> None:
+            """Remove zero-height cardinal triangles for the active split."""
+            # Match top and bottom triangles by serialized coordinates. If
+            # only one pair remains, keep that triangle and filter its walls.
+            if self.topquad is None or self.bottomquad is None:
+                return
+
+            top_triangles = self.topquad.get_triangles(
+                split_rotation=split_rotation,
+            )
+            bottom_triangles = self.bottomquad.get_triangles(
+                split_rotation=split_rotation,
+            )
+            if len(top_triangles) != len(bottom_triangles):
+                return
+
+            bottom_signatures = [
+                triangle_signature(triangle)
+                for triangle in bottom_triangles
+            ]
+            matched_top_indexes: set[int] = set()
+            matched_bottom_indexes: set[int] = set()
+
+            # Match each top triangle to at most one serialized-equal bottom.
+            for top_index, top_triangle in enumerate(top_triangles):
+                top_signature = triangle_signature(top_triangle)
+                for bottom_index, bottom_signature in enumerate(
+                    bottom_signatures,
+                ):
+                    if bottom_index in matched_bottom_indexes:
+                        continue
+                    if top_signature != bottom_signature:
+                        continue
+                    matched_top_indexes.add(top_index)
+                    matched_bottom_indexes.add(bottom_index)
+                    break
+
+            if not matched_top_indexes:
+                remove_matching_cardinal_corners()
+                return
+
+            remaining_top_triangles = [
+                triangle
+                for index, triangle in enumerate(top_triangles)
+                if index not in matched_top_indexes
+            ]
+            remaining_bottom_triangles = [
+                triangle
+                for index, triangle in enumerate(bottom_triangles)
+                if index not in matched_bottom_indexes
+            ]
+
+            if not remaining_top_triangles and not remaining_bottom_triangles:
+                self.topquad = None
+                self.bottomquad = None
+                self.borders["N"] = False
+                self.borders["W"] = False
+                self.borders["S"] = False
+                self.borders["E"] = False
+                return
+
+            if (
+                len(remaining_top_triangles) == 1
+                and len(remaining_bottom_triangles) == 1
+            ):
+                top_triangle = remaining_top_triangles[0]
+                bottom_triangle = remaining_bottom_triangles[0]
+                self.topquad = quad(
+                    top_triangle[0],
+                    top_triangle[1],
+                    top_triangle[2],
+                    None,
+                )
+                self.bottomquad = quad(
+                    bottom_triangle[0],
+                    bottom_triangle[1],
+                    bottom_triangle[2],
+                    None,
+                )
+                filter_cardinal_borders(
+                    remaining_top_triangles,
+                    remaining_bottom_triangles,
+                )
+
+        # Run cardinal cleanup before clipped cleanup; unclipped cells use
+        # topquad, bottomquad, and the N/S/E/W wall dictionary.
+        remove_matching_cardinal_triangles()
+
+        # Step 3: clipped cells already have explicit triangulated surfaces,
+        # so remove exact matching top/bottom polygons directly.
         removed_surface_polygon = False
         removed_surface_edge_footprints: set[XYEdge] = set()
         if self.topSurfacePolygons and self.bottomSurfacePolygons:
@@ -1024,7 +1162,9 @@ class cell:
                     ti += 1
 
         if removed_surface_polygon:
-            # Rebuild remaining top/bottom boundary indexes after deletions.
+            # Step 4: after clipped surface removal, keep or rebuild clipped
+            # walls only where remaining top and bottom polygon boundaries
+            # still expose the same footprint.
             top_boundary_edge_map = boundary_edge_map(self.topSurfacePolygons)
             bottom_boundary_edge_map = boundary_edge_map(
                 self.bottomSurfacePolygons,
@@ -2046,11 +2186,9 @@ class grid:
                 if j == 10 and i == 10:
                     pass
 
-                if (
-                    self.tile.bottom_raster_variants is not None
-                    and self.tile_info.config.split_rotation == 1
-                ):
+                if self.tile.bottom_raster_variants is not None:
                     c.remove_zero_height_volumes(
+                        split_rotation=self.tile_info.config.split_rotation,
                         output_fileformat=output_fileformat,
                     )
 
