@@ -75,7 +75,7 @@ EmittedBottomSurface: TypeAlias = tuple[
     list[shapely.Polygon] | None,
 ]
 BottomSurfaceProvider: TypeAlias = list[list[EmittedBottomSurface]]
-MESH_OUTPUT_DECIMAL_PRECISION = 6
+MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION = 6
 
 
 def edge_xy_signature(coord0: Coordinate, coord1: Coordinate) -> XYEdge:
@@ -97,6 +97,7 @@ def edge_3d_signature(coord0: Coordinate, coord1: Coordinate) -> Edge3D:
 
 def boundary_edge_map_from_meshes(
     meshes: list[SurfaceMesh] | None,
+    output_fileformat: str | None = None,
 ) -> dict[XYEdge, Edge3D]:
     """Return emitted boundary edges for quads and triangulated polygons."""
     edge_counts: dict[XYEdge, int] = {}
@@ -105,9 +106,21 @@ def boundary_edge_map_from_meshes(
         return {}
 
     def add_edge(coord0: Coordinate, coord1: Coordinate) -> None:
-        footprint = edge_xy_signature(coord0, coord1)
+        if output_fileformat is None:
+            output_coord0 = tuple(coord0[:3])
+            output_coord1 = tuple(coord1[:3])
+        else:
+            output_coord0 = normalize_vertex_to_match_mesh_serialization(
+                coord0,
+                output_fileformat,
+            )
+            output_coord1 = normalize_vertex_to_match_mesh_serialization(
+                coord1,
+                output_fileformat,
+            )
+        footprint = edge_xy_signature(output_coord0, output_coord1)
         edge_counts[footprint] = edge_counts.get(footprint, 0) + 1
-        edge_coords[footprint] = (tuple(coord0[:3]), tuple(coord1[:3]))
+        edge_coords[footprint] = (output_coord0, output_coord1)
 
     for mesh in meshes:
         if isinstance(mesh, quad):
@@ -128,12 +141,12 @@ def boundary_edge_map_from_meshes(
     }
 
 
-def mesh_output_coordinate(
+def normalize_coordinate_to_match_mesh_serialization(
     value: float,
     fileformat: str,
-    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+    decimals: int = MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION,
 ) -> float:
-    """Return the coordinate signature used for STL merge detection."""
+    """Return a coordinate as it will be serialized in mesh output."""
     if fileformat == "STLb":
         value = (
             struct.unpack(
@@ -145,14 +158,14 @@ def mesh_output_coordinate(
     return round(value, decimals) + 0.0
 
 
-def mesh_output_signature(
+def normalize_vertex_to_match_mesh_serialization(
     coord: Coordinate,
     fileformat: str,
-    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+    decimals: int = MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION,
 ) -> tuple[float, ...]:
-    """Return a coordinate key using the current mesh output precision."""
+    """Return a vertex as it will be serialized in mesh output."""
     return tuple(
-        mesh_output_coordinate(
+        normalize_coordinate_to_match_mesh_serialization(
             value=value,
             fileformat=fileformat,
             decimals=decimals,
@@ -161,14 +174,14 @@ def mesh_output_signature(
     )
 
 
-def triangle_collapses_after_mesh_output(
+def triangle_collapses_after_mesh_serialization(
     triangle: Sequence[Coordinate],
     fileformat: str,
-    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+    decimals: int = MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION,
 ) -> bool:
     """Return whether a triangle is degenerate after mesh serialization."""
     p0, p1, p2 = [
-        mesh_output_signature(
+        normalize_vertex_to_match_mesh_serialization(
             coord=coord,
             fileformat=fileformat,
             decimals=decimals,
@@ -196,18 +209,18 @@ def triangle_collapses_after_mesh_output(
     return cross == (0.0, 0.0, 0.0)
 
 
-def polygon_prepared_for_mesh_output(
+def polygon_normalized_to_match_mesh_serialization(
     polygon: shapely.Polygon,
     fileformat: str,
-    decimals: int = MESH_OUTPUT_DECIMAL_PRECISION,
+    decimals: int = MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION,
 ) -> shapely.Polygon | None:
-    """Return a snapped triangle polygon, or None if it collapses."""
+    """Return a serialized-coordinate polygon, or None if it collapses."""
     coords = list(polygon.exterior.coords)
     if len(coords) != 4 or coords[0] != coords[-1]:
         raise ValueError("Expected a closed triangular Polygon.")
 
     exterior = [
-        mesh_output_signature(
+        normalize_vertex_to_match_mesh_serialization(
             coord=coord,
             fileformat=fileformat,
             decimals=decimals,
@@ -216,7 +229,7 @@ def polygon_prepared_for_mesh_output(
     ]
     interiors = [
         [
-            mesh_output_signature(
+            normalize_vertex_to_match_mesh_serialization(
                 coord=coord,
                 fileformat=fileformat,
                 decimals=decimals,
@@ -225,7 +238,7 @@ def polygon_prepared_for_mesh_output(
         ]
         for ring in polygon.interiors
     ]
-    if triangle_collapses_after_mesh_output(
+    if triangle_collapses_after_mesh_serialization(
         triangle=exterior[:3],
         fileformat=fileformat,
         decimals=decimals,
@@ -260,24 +273,26 @@ def make_wall_without_exact_duplicate_vertices(
     v1: vertex,
     v2: vertex,
     v3: vertex,
-    tolerance: float = 0.0,
+    output_fileformat: str = "STLb",
 ) -> quad | None:
     """Create a wall mesh, dropping duplicate vertices.
 
-    Difference meshes can produce wall endpoints where top and bottom are exactly
-    equal. In that case the wall should be a triangle, or omitted when the
-    whole wall has zero height. A tolerance of ``0.0`` preserves exact
-    matching.
+    Difference meshes can produce wall endpoints where top and bottom serialize
+    to the same coordinate. In that case the wall should be a triangle, or
+    omitted when the whole wall has zero height.
     """
     unique_vertices: list[vertex] = []
 
     def same_vertex(a: vertex, b: vertex) -> bool:
-        if tolerance == 0.0:
-            return a.coords == b.coords
         return (
-            abs(a.coords[0] - b.coords[0]) <= tolerance and
-            abs(a.coords[1] - b.coords[1]) <= tolerance and
-            abs(a.coords[2] - b.coords[2]) <= tolerance
+            normalize_vertex_to_match_mesh_serialization(
+                a.coords,
+                output_fileformat,
+            )
+            == normalize_vertex_to_match_mesh_serialization(
+                b.coords,
+                output_fileformat,
+            )
         )
 
     for v in (v0, v1, v2, v3):
@@ -287,7 +302,12 @@ def make_wall_without_exact_duplicate_vertices(
     if len(unique_vertices) < 3:
         return None
     if len(unique_vertices) == 3:
-        return quad(unique_vertices[0], unique_vertices[1], unique_vertices[2], None)
+        return quad(
+            unique_vertices[0],
+            unique_vertices[1],
+            unique_vertices[2],
+            None,
+        )
     return quad(
         unique_vertices[0],
         unique_vertices[1],
@@ -296,19 +316,22 @@ def make_wall_without_exact_duplicate_vertices(
     )
 
 
-def quad_prepared_for_mesh_output(
+def quad_normalized_to_match_mesh_serialization(
     mesh: quad,
     fileformat: str,
     split_rotation: int,
 ) -> quad | None:
-    """Return a quad or triangle after snapping output-close vertices."""
+    """Return a serialized-coordinate quad, or None if it collapses."""
     unique_vertices: list[vertex] = []
     for mesh_vertex in mesh.vl:
         if mesh_vertex is None:
             continue
 
         output_vertex = vertex(
-            *mesh_output_signature(mesh_vertex.coords, fileformat),
+            *normalize_vertex_to_match_mesh_serialization(
+                mesh_vertex.coords,
+                fileformat,
+            ),
         )
         if not any(
             output_vertex.coords == existing.coords
@@ -320,7 +343,7 @@ def quad_prepared_for_mesh_output(
         return None
 
     if len(unique_vertices) == 3:
-        if triangle_collapses_after_mesh_output(
+        if triangle_collapses_after_mesh_serialization(
             triangle=[v.coords for v in unique_vertices],
             fileformat=fileformat,
         ):
@@ -335,7 +358,7 @@ def quad_prepared_for_mesh_output(
     )
     valid_triangles: list[tuple[vertex, ...]] = []
     for triangle in output_quad.get_triangles(split_rotation=split_rotation):
-        if not triangle_collapses_after_mesh_output(
+        if not triangle_collapses_after_mesh_serialization(
             triangle=[v.coords for v in triangle],
             fileformat=fileformat,
         ):
@@ -405,21 +428,21 @@ class cell:
 
         return meshes
 
-    def remove_close_geometry_mesh_output_collapsed(
+    def remove_geometry_collapsed_by_mesh_serialization(
         self,
         output_fileformat: str,
         split_rotation: int,
     ) -> None:
         """Remove cell meshes whose vertices merge at output precision."""
         if self.topquad is not None:
-            self.topquad = quad_prepared_for_mesh_output(
+            self.topquad = quad_normalized_to_match_mesh_serialization(
                 self.topquad,
                 output_fileformat,
                 split_rotation,
             )
 
         if self.bottomquad is not None:
-            self.bottomquad = quad_prepared_for_mesh_output(
+            self.bottomquad = quad_normalized_to_match_mesh_serialization(
                 self.bottomquad,
                 output_fileformat,
                 split_rotation,
@@ -428,7 +451,7 @@ class cell:
         for direction, border in self.borders.items():
             if border is not False:
                 self.borders[direction] = (
-                    quad_prepared_for_mesh_output(
+                    quad_normalized_to_match_mesh_serialization(
                         border,
                         output_fileformat,
                         split_rotation,
@@ -438,7 +461,7 @@ class cell:
         if self.surfacePolygonBorders:
             surface_borders = []
             for surface_border in self.surfacePolygonBorders:
-                output_border = quad_prepared_for_mesh_output(
+                output_border = quad_normalized_to_match_mesh_serialization(
                     surface_border,
                     output_fileformat,
                     split_rotation,
@@ -487,7 +510,6 @@ class cell:
         self,
         bottom_surface_quad: quad | None,
         bottom_surface_polygons: list[shapely.Polygon] | None,
-        zero_height_tolerance: float,
         split_rotation: int,
         output_fileformat: str | None = None,
     ) -> None:
@@ -496,7 +518,7 @@ class cell:
         Pair mode uses this after the normal mesh is emitted. The replacement
         preserves the difference top surface and wall footprint decisions, but
         swaps the bottom surface to the exact normal top geometry for the same
-        cell. A tolerance of ``0.0`` keeps wall duplicate removal exact.
+        cell.
         """
         replacement_bottom_quad = bottom_surface_quad
         if self.topSurfacePolygons and bottom_surface_quad is not None:
@@ -519,9 +541,11 @@ class cell:
                         "return a Polygon."
                     )
                 if output_fileformat is not None:
-                    bottom_polygon = polygon_prepared_for_mesh_output(
-                        bottom_polygon,
-                        output_fileformat,
+                    bottom_polygon = (
+                        polygon_normalized_to_match_mesh_serialization(
+                            bottom_polygon,
+                            output_fileformat,
+                        )
                     )
                     if bottom_polygon is None:
                         continue
@@ -547,7 +571,7 @@ class cell:
                 self.bottomquad = replacement_bottom_quad
             self.bottomSurfacePolygons = bottom_surface_polygons
             self.borders = {drct: False for drct in ["N", "S", "E", "W"]}
-            self._rebuild_surface_polygon_borders(zero_height_tolerance)
+            self._rebuild_surface_polygon_borders(output_fileformat)
             return
 
         if bottom_surface_quad is None:
@@ -558,11 +582,11 @@ class cell:
         self.bottomquad = bottom_surface_quad
         self.bottomSurfacePolygons = None
         self.surfacePolygonBorders = None
-        self._rebuild_cardinal_borders(zero_height_tolerance)
+        self._rebuild_cardinal_borders(output_fileformat)
 
     def _rebuild_cardinal_borders(
         self,
-        zero_height_tolerance: float,
+        output_fileformat: str | None,
     ) -> None:
         """Rebuild existing cardinal walls after replacing a bottom quad."""
         top_vertices = self.topquad.vl
@@ -576,7 +600,7 @@ class cell:
                     top_vertices[0],
                     top_vertices[3],
                     bottom_vertices[1],
-                    tolerance=zero_height_tolerance,
+                    output_fileformat=output_fileformat or "STLb",
                 ) or False
             )
         if self.borders.get("S") is not False:
@@ -586,7 +610,7 @@ class cell:
                     top_vertices[2],
                     top_vertices[1],
                     bottom_vertices[3],
-                    tolerance=zero_height_tolerance,
+                    output_fileformat=output_fileformat or "STLb",
                 ) or False
             )
         if self.borders.get("E") is not False:
@@ -596,7 +620,7 @@ class cell:
                     top_vertices[2],
                     bottom_vertices[2],
                     bottom_vertices[1],
-                    tolerance=zero_height_tolerance,
+                    output_fileformat=output_fileformat or "STLb",
                 ) or False
             )
         if self.borders.get("W") is not False:
@@ -606,7 +630,7 @@ class cell:
                     top_vertices[0],
                     bottom_vertices[0],
                     bottom_vertices[3],
-                    tolerance=zero_height_tolerance,
+                    output_fileformat=output_fileformat or "STLb",
                 ) or False
             )
 
@@ -614,20 +638,24 @@ class cell:
 
     def _rebuild_surface_polygon_borders(
         self,
-        zero_height_tolerance: float,
+        output_fileformat: str | None,
     ) -> None:
         """Rebuild existing clipped wall footprints with shared bottom edges."""
         requested_footprints: set[XYEdge] = set()
+        mesh_fileformat = output_fileformat or "STLb"
         if self.surfacePolygonBorders:
             for surface_border in self.surfacePolygonBorders:
                 xy_coords: list[tuple[float, float]] = []
                 for border_vertex in surface_border.vl:
                     if border_vertex is None:
                         continue
-                    xy = (
-                        border_vertex.coords[0],
-                        border_vertex.coords[1],
+                    output_coord = (
+                        normalize_vertex_to_match_mesh_serialization(
+                            border_vertex.coords,
+                            mesh_fileformat,
+                        )
                     )
+                    xy = (output_coord[0], output_coord[1])
                     if xy not in xy_coords:
                         xy_coords.append(xy)
                 if len(xy_coords) == 2:
@@ -641,9 +669,11 @@ class cell:
 
         top_boundary_edge_map = boundary_edge_map_from_meshes(
             self.topSurfacePolygons,
+            output_fileformat=mesh_fileformat,
         )
         bottom_boundary_edge_map = boundary_edge_map_from_meshes(
             self.bottomSurfacePolygons,
+            output_fileformat=mesh_fileformat,
         )
         missing_top = requested_footprints - set(top_boundary_edge_map)
         missing_bottom = requested_footprints - set(bottom_boundary_edge_map)
@@ -669,7 +699,7 @@ class cell:
                 vertex(*top_edge[0]),
                 vertex(*bottom_edge[1]),
                 vertex(*bottom_edge[0]),
-                tolerance=zero_height_tolerance,
+                output_fileformat=mesh_fileformat,
             )
             if wall is not None:
                 rebuilt_borders.append(wall)
@@ -742,7 +772,7 @@ class cell:
     
     def remove_zero_height_volumes(
         self,
-        zero_height_tolerance: float = 0.0,
+        output_fileformat: str = "STLb",
     ) -> None:
         """Remove zero-height cell geometry in place.
 
@@ -750,12 +780,19 @@ class cell:
         clipped wall borders. Matching clipped top/bottom polygons are deleted,
         then ``surfacePolygonBorders`` is filtered or rebuilt so only walls
         still supported by both remaining clipped-surface boundaries are kept.
-        A tolerance of ``0.0`` means exact equality; nonzero values are
-        absolute model-unit tolerances.
         """
-
         # Local helpers normalize clipped surface boundaries and edge
-        # signatures.
+        # signatures to the coordinates emitted by the mesh writer.
+        def output_signature(coord: Coordinate) -> tuple[float, ...]:
+            return normalize_vertex_to_match_mesh_serialization(
+                coord,
+                output_fileformat,
+            )
+
+        def same_output_coord(a: vertex, b: vertex) -> bool:
+            """Return True when vertices serialize to the same coordinate."""
+            return output_signature(a.coords) == output_signature(b.coords)
+
         def remaining_surface_boundary(
             surface_polygons: list[shapely.Polygon] | None,
         ) -> shapely.Geometry | None:
@@ -776,7 +813,8 @@ class cell:
             for v in surface_border.vl:
                 if v is None:
                     continue
-                xy = (v.coords[0], v.coords[1])
+                output_coord = output_signature(v.coords)
+                xy = (output_coord[0], output_coord[1])
                 if xy not in xy_coords:
                     xy_coords.append(xy)
             if len(xy_coords) != 2:
@@ -791,8 +829,8 @@ class cell:
             return tuple(
                 sorted(
                     (
-                        (coord0[0], coord0[1]),
-                        (coord1[0], coord1[1]),
+                        output_signature(coord0)[:2],
+                        output_signature(coord1)[:2],
                     )
                 )
             )
@@ -802,7 +840,14 @@ class cell:
             coord1: Coordinate,
         ) -> Edge3D:
             # Normalize 3D edge direction so top/bottom edge tests are stable.
-            return tuple(sorted((tuple(coord0[:3]), tuple(coord1[:3]))))
+            return tuple(
+                sorted(
+                    (
+                        output_signature(coord0),
+                        output_signature(coord1),
+                    )
+                )
+            )
 
         def polygon_edge_footprints(polygon: shapely.Polygon) -> set[XYEdge]:
             # Collect all XY boundary edges for a removed clipped polygon.
@@ -837,8 +882,8 @@ class cell:
                             edge_counts.get(footprint, 0) + 1
                         )
                         edge_coords[footprint] = (
-                            tuple(coords[ci][:3]),
-                            tuple(coords[ci + 1][:3]),
+                            output_signature(coords[ci]),
+                            output_signature(coords[ci + 1]),
                         )
             return {
                 footprint: coords
@@ -868,7 +913,10 @@ class cell:
             # Triangular walls have one top and one bottom non-vertical edge.
             for ai in range(len(vertices)):
                 for bi in range(ai + 1, len(vertices)):
-                    if vertices[ai].coords[:2] == vertices[bi].coords[:2]:
+                    if (
+                        output_signature(vertices[ai].coords)[:2]
+                        == output_signature(vertices[bi].coords)[:2]
+                    ):
                         continue
                     non_vertical_edges.append(
                         edge_3d_signature(
@@ -895,41 +943,51 @@ class cell:
         """
         
         # First handle the cardinal quad cases, which have fixed corner order.
-        if (tvl[0].coords[2] == bvl[0].coords[2] and
-                tvl[1].coords[2] == bvl[3].coords[2] and
-                tvl[2].coords[2] == bvl[2].coords[2] and
-                tvl[3].coords[2] == bvl[1].coords[2]):
+        if (
+            same_output_coord(tvl[0], bvl[0])
+            and same_output_coord(tvl[1], bvl[3])
+            and same_output_coord(tvl[2], bvl[2])
+            and same_output_coord(tvl[3], bvl[1])
+        ):
             self.topquad = None #quad(None, None, None, None)
             self.bottomquad = None #quad(None, None, None, None)
             b["N"] = b["W"] = b["S"] = b["E"] = False
         # (NW case) NW NE SW vertices are same Z, keep tri of SE SW NE
-        elif (tvl[0].coords[2] == bvl[0].coords[2] and 
-                tvl[3].coords[2] == bvl[1].coords[2] and 
-                tvl[1].coords[2] == bvl[3].coords[2]):
+        elif (
+            same_output_coord(tvl[0], bvl[0])
+            and same_output_coord(tvl[3], bvl[1])
+            and same_output_coord(tvl[1], bvl[3])
+        ):
             self.topquad = quad(tvl[3], tvl[1], tvl[2], None)
-            self.bottomquad = quad(bvl[1], bvl[2], bvl[3], None) 
+            self.bottomquad = quad(bvl[1], bvl[2], bvl[3], None)
             b["N"] = False #quad(tvl[1], tvl[3], bvl[1], bvl[3])
             b["W"] = False
         # (NE case) NW NE SE vertices are same Z, keep tri of SE SW NW
-        elif (tvl[0].coords[2] == bvl[0].coords[2] and 
-                tvl[3].coords[2] == bvl[1].coords[2] and 
-                tvl[2].coords[2] == bvl[2].coords[2]):
+        elif (
+            same_output_coord(tvl[0], bvl[0])
+            and same_output_coord(tvl[3], bvl[1])
+            and same_output_coord(tvl[2], bvl[2])
+        ):
             self.topquad = quad(tvl[0], tvl[1], tvl[2], None)
-            self.bottomquad = quad(bvl[0], bvl[2], bvl[3], None) 
+            self.bottomquad = quad(bvl[0], bvl[2], bvl[3], None)
             b["N"] = False #quad(tvl[0], tvl[2], bvl[2], bvl[0])
-            b["E"] = False 
+            b["E"] = False
         # (SE case) NE SE SW vertices are same Z, keep tri of SW NW NE
-        elif (tvl[3].coords[2] == bvl[1].coords[2] and 
-                tvl[1].coords[2] == bvl[3].coords[2] and 
-                tvl[2].coords[2] == bvl[2].coords[2]):
+        elif (
+            same_output_coord(tvl[3], bvl[1])
+            and same_output_coord(tvl[1], bvl[3])
+            and same_output_coord(tvl[2], bvl[2])
+        ):
             self.topquad = quad(tvl[3], tvl[0], tvl[1], None)
             self.bottomquad = quad(bvl[3], bvl[0], bvl[1], None)
             b["S"] = False #quad(tvl[3], tvl[1], bvl[3], bvl[1])
             b["E"] = False
         # (SW case) SE SW NW vertices are same Z, keep tri of NW NE SE
-        elif (tvl[0].coords[2] == bvl[0].coords[2] and 
-                tvl[1].coords[2] == bvl[3].coords[2] and 
-                tvl[2].coords[2] == bvl[2].coords[2]):
+        elif (
+            same_output_coord(tvl[0], bvl[0])
+            and same_output_coord(tvl[1], bvl[3])
+            and same_output_coord(tvl[2], bvl[2])
+        ):
             self.topquad = quad(tvl[2], tvl[3], tvl[0], None)
             self.bottomquad = quad(bvl[0], bvl[1], bvl[2], None)
             b["S"] = False #quad(tvl[2], tvl[0], bvl[0], bvl[2])
@@ -949,7 +1007,6 @@ class cell:
                     if polygons_equal_3d(
                         top_surface_polygon,
                         bottom_surface_polygon,
-                        tol=zero_height_tolerance,
                     ):
                         removed_surface_edge_footprints.update(
                             polygon_edge_footprints(top_surface_polygon)
@@ -1101,7 +1158,7 @@ class cell:
                     vertex(*top_edge[0]),
                     vertex(*bottom_edge[1]),
                     vertex(*bottom_edge[0]),
-                    tolerance=zero_height_tolerance,
+                    output_fileformat=output_fileformat,
                 )
                 if tb_wall is not None:
                     new_surface_polygon_borders.append(tb_wall)
@@ -1463,7 +1520,10 @@ class grid:
         Note that for obj, two streams/files are needed, one for indices that define the vertices for each triangle and one
         for vertex coordinates. Here, only the index part (s[1] and fo[1]) is stored, the vertex coordinates will be
         created and stored later based on the keys of the vertex class attribute vertex_index_dict'''
-        
+        normalize_polygon_for_serialization = (
+            polygon_normalized_to_match_mesh_serialization
+        )
+
         if self.tile_info is None:
             print("create_cells: Error: self.tile_info is None")
             return
@@ -1635,7 +1695,7 @@ class grid:
                                 #tri_with_z = interpolate_geometry_with_quad(geometry=tri_ccw_order, quad=topq, split_rotation=self.tile_info.config.split_rotation)
                                 if isinstance(tri_with_z, shapely.Polygon):
                                     top_surface_polygons_triangulated_3D.append(
-                                        polygon_prepared_for_mesh_output(
+                                        normalize_polygon_for_serialization(
                                             tri_with_z,
                                             output_fileformat,
                                         )
@@ -1731,7 +1791,7 @@ class grid:
                             tri_with_z = interpolate_z_planar(geometry_2d=tri_cw_order, planes_3d=botq.get_triangles_in_polygons(split_rotation=self.tile_info.config.split_rotation))
                             if isinstance(tri_with_z, shapely.Polygon):
                                 bottom_surface_polygons_triangulated_3D.append(
-                                    polygon_prepared_for_mesh_output(
+                                    normalize_polygon_for_serialization(
                                         tri_with_z,
                                         output_fileformat,
                                     )
@@ -1832,6 +1892,7 @@ class grid:
                                 NWt,
                                 NEt,
                                 NEb,
+                                output_fileformat=output_fileformat,
                             ) or False
                         )
                     if borders["S"] == True:
@@ -1841,6 +1902,7 @@ class grid:
                                 SEt,
                                 SWt,
                                 SWb,
+                                output_fileformat=output_fileformat,
                             ) or False
                         )
                     if borders["E"] == True:
@@ -1850,6 +1912,7 @@ class grid:
                                 SEt,
                                 SEb,
                                 NEb,
+                                output_fileformat=output_fileformat,
                             ) or False
                         )
                     if borders["W"] == True:
@@ -1859,6 +1922,7 @@ class grid:
                                 NWt,
                                 NWb,
                                 SWb,
+                                output_fileformat=output_fileformat,
                             ) or False
                         )
 
@@ -1912,6 +1976,7 @@ class grid:
                                     top_edge_v1,
                                     bot_edge_v0,
                                     bot_edge_v1,
+                                    output_fileformat=output_fileformat,
                                 )
                                 if tb_wall is not None:
                                     surface_polygon_borders_3D.append(tb_wall)
@@ -1967,9 +2032,6 @@ class grid:
                         c.replace_bottom_surfaces(
                             bottom_surface_quad=bottom_quad,
                             bottom_surface_polygons=bottom_polygons,
-                            zero_height_tolerance=(
-                                self.tile_info.config.zero_height_tolerance
-                            ),
                             split_rotation=(
                                 self.tile_info.config.split_rotation
                             ),
@@ -1989,9 +2051,7 @@ class grid:
                     and self.tile_info.config.split_rotation == 1
                 ):
                     c.remove_zero_height_volumes(
-                        zero_height_tolerance=(
-                            self.tile_info.config.zero_height_tolerance
-                        ),
+                        output_fileformat=output_fileformat,
                     )
 
                 # if we have nan cells, do some postprocessing on this cell to get rid of stair case patterns
@@ -2008,8 +2068,9 @@ class grid:
                     if c.check_for_tri_cell():
                         c.convert_to_tri_cell()
 
-                # Snap and remove close geometry that would be collapsed during mesh output (based on output format e.g. STL) in cell fields before doing more cell creation with them.
-                c.remove_close_geometry_mesh_output_collapsed(
+                # Normalize and remove geometry that would collapse during mesh
+                # serialization before storing the cell.
+                c.remove_geometry_collapsed_by_mesh_serialization(
                     output_fileformat=output_fileformat,
                     split_rotation=self.tile_info.config.split_rotation,
                 )
@@ -2048,7 +2109,7 @@ class grid:
                         )
                     return output
 
-                decimal_precision = MESH_OUTPUT_DECIMAL_PRECISION
+                decimal_precision = MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION
 
                 # Debug: inspect cell
                 if j == 6 and i == 5:
@@ -2152,7 +2213,7 @@ class grid:
             self.s.write(
                 ASCII_FACET.format(
                     face=tl,
-                    precision=MESH_OUTPUT_DECIMAL_PRECISION,
+                    precision=MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION,
                 )
             )
 

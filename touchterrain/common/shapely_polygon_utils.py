@@ -10,13 +10,11 @@ from shapely.ops import orient
 def polygons_equal_3d(
     a: shapely.Polygon,
     b: shapely.Polygon,
-    tol: float = 0.0,
 ) -> bool:
     """Return True when two polygons share XY footprint and Z values.
 
-    ``tol`` is an absolute tolerance in model units. The default ``0.0``
-    requires exact equality; nonzero values use ``rtol=0.0`` so relative
-    differences do not count as equal.
+    Coordinates must match exactly. Callers that need mesh-output equality
+    should normalize coordinates before calling this function.
     """
     if not a.equals(b):
         return False
@@ -43,8 +41,8 @@ def polygons_equal_3d(
         start = int(np.argmin(diffs))
         rb_rot = np.concatenate([rb[start:], rb[:start]], axis=0)
         if not (
-            np.allclose(ra[:, :2], rb_rot[:, :2], atol=tol, rtol=0.0)
-            and np.allclose(ra[:, 2], rb_rot[:, 2], atol=tol, rtol=0.0)
+            np.array_equal(ra[:, :2], rb_rot[:, :2])
+            and np.array_equal(ra[:, 2], rb_rot[:, 2])
         ):
             return False
     return True
