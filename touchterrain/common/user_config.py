@@ -76,8 +76,11 @@ class TouchTerrainConfig:
 
     The pair is generated using the existing single-mesh generators.
     """
-    shared_z0_edge_corner_nudge = False
-    "Nudge corners on shared z=0 edges between cells. This fixes the nonmanifold error where an edge is used by more than 2 faces."
+    nudge_in_overused_edges_vertex: bool = False
+    """Reserved flag for exact serialized-coordinate edge/corner nudging.
+
+    Runtime nudge behavior is intentionally not implemented in this revision.
+    """
     max_cells_for_memory_only = 500 * 500 * 4
     "if total number of cells is bigger, use temp_file instead using memory only"
     no_normals = True 

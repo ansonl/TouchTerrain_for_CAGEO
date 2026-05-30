@@ -9,7 +9,7 @@ contact cases or all-4-corner cases.
 The first implementation covers 1 affected corner, 2 adjacent affected corners,
 2 opposite affected corners, and 3 affected corners.
 
-When `shared_z0_edge_corner_nudge` is enabled, both regular square cells and
+When `nudge_in_overused_edges_vertex` is enabled, both regular square cells and
 polygon-clipped cells must be handled. If clipped cells are not handled, a
 nudged square cell can leave a gap or keep a nonmanifold `Z=0` edge where it
 neighbors clipped-boundary geometry.
@@ -265,7 +265,7 @@ SW -> SE -> NE -> NW -> SW
 
 ## Clipped Cells
 
-Clipped cells must be handled when `shared_z0_edge_corner_nudge` is enabled.
+Clipped cells must be handled when `nudge_in_overused_edges_vertex` is enabled.
 If they are not handled, a nudged square cell can leave a gap or keep a
 nonmanifold `Z=0` edge where it neighbors clipped-boundary geometry.
 
