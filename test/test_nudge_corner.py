@@ -3,7 +3,12 @@ import numpy
 import unittest
 
 from touchterrain.common.RasterVariants import RasterVariants
-from touchterrain.common.nudge_corner import IntermediateCorner, corner_directions_border_outward_by_lte, find_middle_corner
+from touchterrain.common.nudge_corner import (
+    IntermediateCorner,
+    corner_directions_border_outward_by_lte,
+    find_middle_corner,
+    z0_nudge_corners_from_source_raster,
+)
 
 # pytest -s .\test\test_nudge_corner.py
 
@@ -70,3 +75,47 @@ class TestNudgeCorners(unittest.TestCase):
         case_NE = [IntermediateCorner.SE, IntermediateCorner.NE, IntermediateCorner.NW]
         for c in [list(p) for p in itertools.permutations(case_NE)]:
             self.assertEqual(find_middle_corner(c), IntermediateCorner.NE)
+
+    def test_z0_source_window_nudge_corners(self):
+        def corners_for(positive_cells):
+            raster = numpy.zeros((5, 5))
+            for location in positive_cells:
+                raster[location] = 1
+            return set(
+                z0_nudge_corners_from_source_raster(
+                    raster=raster,
+                    cell_location=(2, 2),
+                )
+            )
+
+        self.assertEqual(corners_for([]), set())
+        self.assertEqual(
+            corners_for([(1, 3)]),
+            {
+                IntermediateCorner.NW,
+                IntermediateCorner.SW,
+                IntermediateCorner.SE,
+            },
+        )
+        self.assertEqual(
+            corners_for([(1, 3), (3, 3)]),
+            {IntermediateCorner.NW, IntermediateCorner.SW},
+        )
+        self.assertEqual(
+            corners_for([(1, 3), (3, 1)]),
+            {IntermediateCorner.NW, IntermediateCorner.SE},
+        )
+        self.assertEqual(
+            corners_for([(1, 3), (3, 3), (3, 1)]),
+            {IntermediateCorner.NW},
+        )
+
+        positive_current = numpy.zeros((5, 5))
+        positive_current[2, 2] = 1
+        self.assertEqual(
+            z0_nudge_corners_from_source_raster(
+                raster=positive_current,
+                cell_location=(2, 2),
+            ),
+            [],
+        )

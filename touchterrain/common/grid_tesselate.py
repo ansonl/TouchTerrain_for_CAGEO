@@ -57,6 +57,10 @@ from touchterrain.common.tile_info import TouchTerrainTileInfo
 
 from touchterrain.common.RasterVariants import RasterVariants
 from touchterrain.common.BorderEdge import BorderEdge
+from touchterrain.common.nudge_corner import (
+    IntermediateCorner,
+    z0_nudge_corners_from_source_raster,
+)
 
 from touchterrain.common.shapely_utils import flatten_geometries
 from touchterrain.common.shapely_polygon_utils import (
@@ -245,6 +249,325 @@ def polygon_normalized_to_match_mesh_serialization(
     ):
         return None
     return shapely.Polygon(exterior, interiors)
+
+
+def _iter_polygon_parts(geometry: shapely.Geometry) -> list[shapely.Polygon]:
+    """Return non-empty polygon parts from a Shapely geometry."""
+    if geometry.is_empty:
+        return []
+    if isinstance(geometry, shapely.Polygon):
+        return [geometry] if geometry.area > 0 else []
+    polygons: list[shapely.Polygon] = []
+    if hasattr(geometry, "geoms"):
+        for child in geometry.geoms:
+            polygons.extend(_iter_polygon_parts(child))
+    return polygons
+
+
+def _z0_cell_points(
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+) -> dict[str, tuple[float, float]]:
+    mid_x = (W + E) / 2
+    mid_y = (N + S) / 2
+    return {
+        "SW": (W, S),
+        "SE": (E, S),
+        "NE": (E, N),
+        "NW": (W, N),
+        "Smid": (mid_x, S),
+        "Emid": (E, mid_y),
+        "Nmid": (mid_x, N),
+        "Wmid": (W, mid_y),
+    }
+
+
+def _z0_full_cell_footprint(
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+) -> shapely.Polygon:
+    points = _z0_cell_points(W, E, N, S)
+    return shapely.Polygon(
+        [
+            points["SW"],
+            points["SE"],
+            points["NE"],
+            points["NW"],
+            points["SW"],
+        ]
+    )
+
+
+def _z0_normal_keep_footprint(
+    affected_corners: Sequence[IntermediateCorner],
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+) -> shapely.Polygon | None:
+    """Return the normal-mode keep footprint for a Z0 affected-corner set."""
+    vertex_names = _z0_normal_keep_vertex_names(affected_corners)
+    if vertex_names is None:
+        return None
+    points = _z0_cell_points(W, E, N, S)
+    return shapely.Polygon([points[name] for name in vertex_names])
+
+
+def _z0_normal_keep_vertex_names(
+    affected_corners: Sequence[IntermediateCorner],
+) -> list[str] | None:
+    """Return vertex names for the normal-mode keep footprint."""
+    affected = frozenset(affected_corners)
+    c = IntermediateCorner
+    footprints = {
+        frozenset([c.SW]): ["Smid", "SE", "NE", "NW", "Wmid"],
+        frozenset([c.SE]): ["SW", "Smid", "Emid", "NE", "NW"],
+        frozenset([c.NE]): ["SW", "SE", "Emid", "Nmid", "NW"],
+        frozenset([c.NW]): ["SW", "SE", "NE", "Nmid", "Wmid"],
+        frozenset([c.SW, c.SE]): ["Wmid", "Emid", "NE", "NW"],
+        frozenset([c.SE, c.NE]): ["SW", "Smid", "Nmid", "NW"],
+        frozenset([c.NW, c.NE]): ["SW", "SE", "Emid", "Wmid"],
+        frozenset([c.SW, c.NW]): ["Smid", "SE", "NE", "Nmid"],
+        frozenset([c.SW, c.NE]): [
+            "Smid",
+            "SE",
+            "Emid",
+            "Nmid",
+            "NW",
+            "Wmid",
+        ],
+        frozenset([c.SE, c.NW]): [
+            "SW",
+            "Smid",
+            "Emid",
+            "NE",
+            "Nmid",
+            "Wmid",
+        ],
+        frozenset([c.SW, c.NW, c.NE]): ["Smid", "SE", "Emid"],
+        frozenset([c.NW, c.SW, c.SE]): ["Nmid", "Emid", "NE"],
+        frozenset([c.SW, c.SE, c.NE]): ["Wmid", "Nmid", "NW"],
+        frozenset([c.SE, c.NE, c.NW]): ["SW", "Smid", "Wmid"],
+    }
+    return footprints.get(affected)
+
+
+def _z0_adjusted_keep_surface_planes(
+    affected_corners: Sequence[IntermediateCorner],
+    corner_vertices: dict[IntermediateCorner, vertex],
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+    output_fileformat: str,
+) -> list[shapely.Polygon]:
+    """Return nudge-adjusted surface triangles with inserted midpoints at Z0."""
+    vertex_names = _z0_normal_keep_vertex_names(affected_corners)
+    if vertex_names is None:
+        return []
+
+    points = _z0_cell_points(W, E, N, S)
+    corner_z = {
+        "NW": corner_vertices[IntermediateCorner.NW].coords[2],
+        "NE": corner_vertices[IntermediateCorner.NE].coords[2],
+        "SW": corner_vertices[IntermediateCorner.SW].coords[2],
+        "SE": corner_vertices[IntermediateCorner.SE].coords[2],
+        "Nmid": 0.0,
+        "Smid": 0.0,
+        "Emid": 0.0,
+        "Wmid": 0.0,
+    }
+    z_by_xy = {
+        points[name]: corner_z[name]
+        for name in vertex_names
+    }
+    footprint_2d = shapely.Polygon([points[name] for name in vertex_names])
+    planes: list[shapely.Polygon] = []
+    triangles = shapely.constrained_delaunay_triangles(footprint_2d)
+    for triangle in _iter_polygon_parts(triangles):
+        coords_3d = []
+        for x, y in list(triangle.exterior.coords)[:-1]:
+            z = z_by_xy.get((x, y))
+            if z is None:
+                raise ValueError(
+                    "Z0 nudge adjusted plane includes an unexpected vertex."
+                )
+            coords_3d.append((x, y, z))
+        coords_3d.append(coords_3d[0])
+        normalized_triangle = polygon_normalized_to_match_mesh_serialization(
+            shapely.Polygon(coords_3d),
+            output_fileformat,
+        )
+        if normalized_triangle is not None:
+            planes.append(normalized_triangle)
+    return planes
+
+
+def _union_polygon_footprint(
+    geometries: list[shapely.Geometry] | None,
+    fallback: shapely.Polygon,
+) -> shapely.Geometry:
+    if not geometries:
+        return fallback
+    polygons: list[shapely.Polygon] = []
+    for geometry in geometries:
+        polygons.extend(_iter_polygon_parts(shapely.force_2d(geometry)))
+    if not polygons:
+        return shapely.GeometryCollection()
+    return shapely.union_all(polygons)
+
+
+def _triangulate_2d_geometry_to_3d_polygons(
+    geometry: shapely.Geometry,
+    planes_3d: list[shapely.Polygon],
+    exterior_cw: bool,
+    output_fileformat: str,
+) -> list[shapely.Polygon]:
+    output: list[shapely.Polygon] = []
+    for polygon in _iter_polygon_parts(geometry):
+        triangles = shapely.constrained_delaunay_triangles(polygon)
+        for triangle in _iter_polygon_parts(triangles):
+            oriented_triangle = shapely.orient_polygons(
+                triangle,
+                exterior_cw=exterior_cw,
+            )
+            triangle_3d = interpolate_z_planar(
+                geometry_2d=oriented_triangle,
+                planes_3d=planes_3d,
+            )
+            if not isinstance(triangle_3d, shapely.Polygon):
+                raise TypeError("Z0 nudge interpolation did not return a Polygon.")
+            normalized_triangle = polygon_normalized_to_match_mesh_serialization(
+                triangle_3d,
+                output_fileformat,
+            )
+            if normalized_triangle is not None:
+                output.append(normalized_triangle)
+    return output
+
+
+def _surface_wall_requested_lines(
+    surface_polygon_borders: list[quad] | None,
+) -> shapely.Geometry | None:
+    lines: list[shapely.LineString] = []
+    if not surface_polygon_borders:
+        return None
+    for surface_border in surface_polygon_borders:
+        xy_coords: list[tuple[float, float]] = []
+        for border_vertex in surface_border.vl:
+            if border_vertex is None:
+                continue
+            xy = (border_vertex.coords[0], border_vertex.coords[1])
+            if xy not in xy_coords:
+                xy_coords.append(xy)
+        if len(xy_coords) == 2:
+            lines.append(shapely.LineString(xy_coords))
+    if not lines:
+        return None
+    return shapely.union_all(lines)
+
+
+def _z0_rebuild_surface_polygon_borders(
+    top_surfaces: list[shapely.Polygon],
+    bottom_surfaces: list[shapely.Polygon],
+    borders: dict[str, quad],
+    previous_surface_polygon_borders: list[quad] | None,
+    full_footprint: shapely.Geometry,
+    include_normal_cut_edges: bool,
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+    output_fileformat: str,
+) -> list[quad]:
+    """Build current-cell walls requested by existing borders after nudging."""
+    top_boundary_edges = boundary_edge_map_from_meshes(
+        top_surfaces,
+        output_fileformat=output_fileformat,
+    )
+    bottom_boundary_edges = boundary_edge_map_from_meshes(
+        bottom_surfaces,
+        output_fileformat=output_fileformat,
+    )
+    requested_clipped_lines = _surface_wall_requested_lines(
+        previous_surface_polygon_borders,
+    )
+    footprint_boundary = shapely.force_2d(full_footprint).boundary
+
+    side_values = {
+        "N": normalize_coordinate_to_match_mesh_serialization(
+            N,
+            output_fileformat,
+        ),
+        "S": normalize_coordinate_to_match_mesh_serialization(
+            S,
+            output_fileformat,
+        ),
+        "E": normalize_coordinate_to_match_mesh_serialization(
+            E,
+            output_fileformat,
+        ),
+        "W": normalize_coordinate_to_match_mesh_serialization(
+            W,
+            output_fileformat,
+        ),
+    }
+
+    def edge_cardinal_side(footprint: XYEdge) -> str | None:
+        (x0, y0), (x1, y1) = footprint
+        if y0 == side_values["N"] and y1 == side_values["N"]:
+            return "N"
+        if y0 == side_values["S"] and y1 == side_values["S"]:
+            return "S"
+        if x0 == side_values["E"] and x1 == side_values["E"]:
+            return "E"
+        if x0 == side_values["W"] and x1 == side_values["W"]:
+            return "W"
+        return None
+
+    rebuilt_borders: list[quad] = []
+    for footprint, top_edge in top_boundary_edges.items():
+        if footprint not in bottom_boundary_edges:
+            continue
+        line = shapely.LineString(footprint)
+        side = edge_cardinal_side(footprint)
+        requested = side is not None and borders.get(side) is not False
+        if (
+            not requested
+            and requested_clipped_lines is not None
+            and requested_clipped_lines.covers(line)
+        ):
+            requested = True
+        if (
+            not requested
+            and include_normal_cut_edges
+            and side is None
+            and not footprint_boundary.covers(line)
+        ):
+            requested = True
+        if not requested:
+            continue
+
+        bottom_edge = bottom_boundary_edges[footprint]
+        top_start_xy = (top_edge[0][0], top_edge[0][1])
+        bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
+        if top_start_xy == bottom_start_xy:
+            bottom_edge = (bottom_edge[1], bottom_edge[0])
+
+        wall = make_wall_without_exact_duplicate_vertices(
+            vertex(*top_edge[1]),
+            vertex(*top_edge[0]),
+            vertex(*bottom_edge[1]),
+            vertex(*bottom_edge[0]),
+            output_fileformat=output_fileformat,
+        )
+        if wall is not None:
+            rebuilt_borders.append(wall)
+    return rebuilt_borders
 
 
 # function to calculate the normal for a triangle
@@ -1687,6 +2010,10 @@ class grid:
         progress = 0
         print("creating internal triangle data structure for", multiprocessing.current_process(), file=sys.stderr)
         output_fileformat = self.tile_info.config.fileformat
+        nudge_enabled = (
+            self.tile_info.config.nudge_in_overused_edges_vertex
+            and not self.tile_info.config.no_bottom
+        )
 
         for j in range(1, self.ymaxidx+1):# y dimension for looping within the +1 padded raster
             if j % pc_step == 0:
@@ -1850,6 +2177,7 @@ class grid:
                 #
 
                 # get corners for bottom array
+                bottom_raster_for_z0_nudge: np.ndarray | None = None
                 if self.tile.bottom_raster_variants is None:
                     # Normal mode
                     NEelev = NWelev = SEelev = SWelev = 0
@@ -1864,6 +2192,7 @@ class grid:
                             bottom_raster = (
                                 self.tile.bottom_raster_variants.dilated
                             )
+                            bottom_raster_for_z0_nudge = bottom_raster
                             NEelev = interpolate_corner_with_canonical_order(
                                 bottom_raster,
                                 j - 1,
@@ -1886,6 +2215,9 @@ class grid:
                             )
                         else:
                             # Nan aware interpolation 
+                            bottom_raster_for_z0_nudge = (
+                                self.tile.bottom_raster_variants.original
+                            )
                             NEelev, NWelev, SEelev, SWelev = interpolate_with_NaN(self.tile.bottom_raster_variants.original, i, j)
                             
                             # bottom
@@ -1976,6 +2308,183 @@ class grid:
 
                 #print(topq)
                 #print(botq)
+                z0_nudged_cell = False
+                z0_used_bottom_provider = False
+                z0_full_footprint_2D: shapely.Geometry | None = None
+                z0_include_normal_cut_edges = False
+                if nudge_enabled:
+                    if self.tile.bottom_raster_variants is None:
+                        z0_detection_raster = interpolation_top_raster
+                    else:
+                        z0_detection_raster = bottom_raster_for_z0_nudge
+
+                    z0_corners = (
+                        z0_nudge_corners_from_source_raster(
+                            z0_detection_raster,
+                            (j, i),
+                            zero_threshold=self.tile_info.config.basethick,
+                        )
+                        if z0_detection_raster is not None
+                        else []
+                    )
+                    if z0_corners:
+                        top_corner_vertices = {
+                            IntermediateCorner.NW: NWt,
+                            IntermediateCorner.NE: NEt,
+                            IntermediateCorner.SW: SWt,
+                            IntermediateCorner.SE: SEt,
+                        }
+                        bottom_corner_vertices = {
+                            IntermediateCorner.NW: NWb,
+                            IntermediateCorner.NE: NEb,
+                            IntermediateCorner.SW: SWb,
+                            IntermediateCorner.SE: SEb,
+                        }
+
+                        def output_z_is_zero(v: vertex) -> bool:
+                            return (
+                                normalize_vertex_to_match_mesh_serialization(
+                                    v.coords,
+                                    output_fileformat,
+                                )[2]
+                                == 0
+                            )
+
+                        if self.tile.bottom_raster_variants is None:
+                            z0_corners = [
+                                corner
+                                for corner in z0_corners
+                                if output_z_is_zero(top_corner_vertices[corner])
+                                and output_z_is_zero(
+                                    bottom_corner_vertices[corner],
+                                )
+                            ]
+                        else:
+                            z0_corners = [
+                                corner
+                                for corner in z0_corners
+                                if output_z_is_zero(
+                                    bottom_corner_vertices[corner],
+                                )
+                            ]
+                    if 0 < len(z0_corners) < 4:
+                        full_cell_footprint = _z0_full_cell_footprint(
+                            W,
+                            E,
+                            N,
+                            S,
+                        )
+                        keep_footprint = _z0_normal_keep_footprint(
+                            z0_corners,
+                            W,
+                            E,
+                            N,
+                            S,
+                        )
+                        if keep_footprint is not None:
+                            z0_full_footprint_2D = _union_polygon_footprint(
+                                top_bottom_surface_geometries_2D,
+                                full_cell_footprint,
+                            )
+                            keep_geometry = z0_full_footprint_2D.intersection(
+                                keep_footprint,
+                            )
+                            complement_geometry = (
+                                z0_full_footprint_2D.difference(
+                                    keep_footprint,
+                                )
+                            )
+                            top_planes = topq.get_triangles_in_polygons(
+                                split_rotation=self.tile_info.config.split_rotation,
+                            )
+                            z0_top_planes = _z0_adjusted_keep_surface_planes(
+                                z0_corners,
+                                top_corner_vertices,
+                                W,
+                                E,
+                                N,
+                                S,
+                                output_fileformat,
+                            )
+                            z0_bottom_planes = _z0_adjusted_keep_surface_planes(
+                                z0_corners,
+                                bottom_corner_vertices,
+                                W,
+                                E,
+                                N,
+                                S,
+                                output_fileformat,
+                            )
+                            z0_planes = quad(
+                                vertex(W, N, 0),
+                                vertex(W, S, 0),
+                                vertex(E, S, 0),
+                                vertex(E, N, 0),
+                            ).get_triangles_in_polygons(
+                                split_rotation=self.tile_info.config.split_rotation,
+                            )
+                            if self.tile.bottom_raster_variants is None:
+                                top_surface_polygons_triangulated_3D = (
+                                    _triangulate_2d_geometry_to_3d_polygons(
+                                        keep_geometry,
+                                        z0_top_planes,
+                                        exterior_cw=False,
+                                        output_fileformat=output_fileformat,
+                                    )
+                                )
+                                bottom_surface_polygons_triangulated_3D = (
+                                    _triangulate_2d_geometry_to_3d_polygons(
+                                        keep_geometry,
+                                        z0_planes,
+                                        exterior_cw=True,
+                                        output_fileformat=output_fileformat,
+                                    )
+                                )
+                                z0_include_normal_cut_edges = True
+                            else:
+                                if self.tile.bottom_surface_provider is not None:
+                                    z0_used_bottom_provider = True
+                                kept_bottom_polygons = (
+                                    _triangulate_2d_geometry_to_3d_polygons(
+                                        keep_geometry,
+                                        z0_bottom_planes,
+                                        exterior_cw=True,
+                                        output_fileformat=output_fileformat,
+                                    )
+                                )
+
+                                top_surface_polygons_triangulated_3D = []
+                                for top_piece in (
+                                    keep_geometry,
+                                    complement_geometry,
+                                ):
+                                    top_surface_polygons_triangulated_3D.extend(
+                                        _triangulate_2d_geometry_to_3d_polygons(
+                                            top_piece,
+                                            top_planes,
+                                            exterior_cw=False,
+                                            output_fileformat=output_fileformat,
+                                        )
+                                    )
+
+                                bottom_surface_polygons_triangulated_3D = (
+                                    kept_bottom_polygons
+                                    + _triangulate_2d_geometry_to_3d_polygons(
+                                        complement_geometry,
+                                        z0_planes,
+                                        exterior_cw=True,
+                                        output_fileformat=output_fileformat,
+                                    )
+                                )
+
+                            if (
+                                top_surface_polygons_triangulated_3D
+                                and bottom_surface_polygons_triangulated_3D
+                            ):
+                                z0_nudged_cell = True
+                            else:
+                                clipped_surfaces_collapsed_after_output = True
+
                 if clipped_surfaces_collapsed_after_output:
                     self.cells[j - 1, i - 1] = None
                     continue
@@ -2023,7 +2532,7 @@ class grid:
                             if np.isnan(borders_top_raster[j,i+1]): borders["E"] = True
                         except RuntimeWarning:
                             pass # nothing wrong - just here to ignore the warning
-                    
+
                     # Quads for walls: in borders dict, replace any True with a quad of that wall
                     if borders["N"] == True:
                         borders["N"] = (
@@ -2135,11 +2644,45 @@ class grid:
 
                 #endregion
 
+                if z0_nudged_cell:
+                    if (
+                        top_surface_polygons_triangulated_3D is None
+                        or bottom_surface_polygons_triangulated_3D is None
+                    ):
+                        raise RuntimeError(
+                            "Z0 nudged cell is missing final surface polygons."
+                        )
+                    if z0_full_footprint_2D is None:
+                        z0_full_footprint_2D = _z0_full_cell_footprint(
+                            W,
+                            E,
+                            N,
+                            S,
+                        )
+                    surface_polygon_borders_3D = (
+                        _z0_rebuild_surface_polygon_borders(
+                            top_surface_polygons_triangulated_3D,
+                            bottom_surface_polygons_triangulated_3D,
+                            borders,
+                            surface_polygon_borders_3D,
+                            z0_full_footprint_2D,
+                            include_normal_cut_edges=(
+                                z0_include_normal_cut_edges
+                            ),
+                            W=W,
+                            E=E,
+                            N=N,
+                            S=S,
+                            output_fileformat=output_fileformat,
+                        )
+                    )
+                    borders = {drct: False for drct in ["N", "S", "E", "W"]}
+
                 #region Make cell
                 if self.tile_info.config.no_bottom == True:
                     c = cell(topq, None, borders) # omit bottom - do not fill with 2 tris later (may have NaNs)
                 else:
-                    if self.tile_info.have_nan == True or self.tile.bottom_raster_variants is not None: #self.tile_info.have_bottom_array == True: 
+                    if self.tile_info.have_nan == True or self.tile.bottom_raster_variants is not None or nudge_enabled: #self.tile_info.have_bottom_array == True: 
                         # for through water case make sure this in not one of the dilated cells
 
                         c = cell(topq, botq, borders) # full cell: top quad, bottom quad and wall quads
@@ -2154,7 +2697,10 @@ class grid:
                 if surface_polygon_borders_3D:
                     c.surfacePolygonBorders = surface_polygon_borders_3D
 
-                if self.tile.bottom_surface_provider is not None:
+                if (
+                    self.tile.bottom_surface_provider is not None
+                    and not z0_used_bottom_provider
+                ):
                     bottom_provider = self.tile.bottom_surface_provider
                     bottom_quad, bottom_polygons = bottom_provider[j - 1][
                         i - 1
@@ -2186,7 +2732,7 @@ class grid:
                 if j == 10 and i == 10:
                     pass
 
-                if self.tile.bottom_raster_variants is not None:
+                if self.tile.bottom_raster_variants is not None or nudge_enabled:
                     c.remove_zero_height_volumes(
                         split_rotation=self.tile_info.config.split_rotation,
                         output_fileformat=output_fileformat,
@@ -2696,6 +3242,14 @@ class grid:
         
         # with a bottom image/elevation, we also already need a full bottom
         if self.tile_info.config.bottom_image != None or self.tile_info.config.bottom_elevation != None: 
+            add_simple_bottom = False
+
+        # Z0 nudging changes per-cell footprints, so flagged normal tiles use
+        # per-cell bottoms instead of one tile-wide simple bottom.
+        if (
+            self.tile_info.config.nudge_in_overused_edges_vertex
+            and not self.tile_info.config.no_bottom
+        ):
             add_simple_bottom = False
 
         # obj files currently don't support simple bottoms

@@ -50,6 +50,71 @@ def corner_directions_border_outward_by_lte(raster: numpy.ndarray, cell_location
     
     return corners_match
 
+def z0_nudge_corners_from_source_raster(
+    raster: numpy.ndarray,
+    cell_location: tuple[int, int],
+    zero_threshold: float = 0,
+) -> list[IntermediateCorner]:
+    """Return Z0 nudge corners from source-cell contributor windows.
+
+    The target cell must be at or below ``zero_threshold``. The cell is
+    considered only when at least one corner's 2x2 contributor window sees a
+    value above that threshold. A corner needs nudging when its own contributor
+    window does not see a value above the threshold.
+    """
+    row, col = cell_location
+    if row < 0 or row >= raster.shape[0] or col < 0 or col >= raster.shape[1]:
+        return []
+
+    current_value = raster[row, col]
+    if numpy.isnan(current_value) or current_value > zero_threshold:
+        return []
+
+    corner_windows = [
+        (
+            IntermediateCorner.NW,
+            [(row - 1, col - 1), (row - 1, col), (row, col - 1), (row, col)],
+        ),
+        (
+            IntermediateCorner.NE,
+            [(row - 1, col), (row - 1, col + 1), (row, col), (row, col + 1)],
+        ),
+        (
+            IntermediateCorner.SW,
+            [(row, col - 1), (row, col), (row + 1, col - 1), (row + 1, col)],
+        ),
+        (
+            IntermediateCorner.SE,
+            [(row, col), (row, col + 1), (row + 1, col), (row + 1, col + 1)],
+        ),
+    ]
+
+    window_has_positive: dict[IntermediateCorner, bool] = {}
+    for corner, window in corner_windows:
+        has_positive = False
+        for check_row, check_col in window:
+            if (
+                check_row < 0
+                or check_row >= raster.shape[0]
+                or check_col < 0
+                or check_col >= raster.shape[1]
+            ):
+                continue
+            value = raster[check_row, check_col]
+            if not numpy.isnan(value) and value > zero_threshold:
+                has_positive = True
+                break
+        window_has_positive[corner] = has_positive
+
+    if not any(window_has_positive.values()):
+        return []
+
+    return [
+        corner
+        for corner, has_positive in window_has_positive.items()
+        if not has_positive
+    ]
+
 def find_middle_corner(corners: list[IntermediateCorner]) -> IntermediateCorner:
     """Return the spatially middle corner of 3 corners
 

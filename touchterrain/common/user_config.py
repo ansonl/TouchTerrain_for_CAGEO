@@ -77,9 +77,9 @@ class TouchTerrainConfig:
     The pair is generated using the existing single-mesh generators.
     """
     nudge_in_overused_edges_vertex: bool = False
-    """Reserved flag for exact serialized-coordinate edge/corner nudging.
+    """Enable Z=0 overused-edge corner nudging.
 
-    Runtime nudge behavior is intentionally not implemented in this revision.
+    This is ignored when ``no_bottom=True``.
     """
     max_cells_for_memory_only = 500 * 500 * 4
     "if total number of cells is bigger, use temp_file instead using memory only"
