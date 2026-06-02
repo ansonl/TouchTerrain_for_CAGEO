@@ -213,6 +213,35 @@ def triangle_collapses_after_mesh_serialization(
     return cross == (0.0, 0.0, 0.0)
 
 
+def triangle_xy_collapses_after_mesh_serialization(
+    triangle: Sequence[Coordinate],
+    fileformat: str,
+    decimals: int = MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION,
+) -> bool:
+    """Return whether a surface triangle has no serialized XY area."""
+    p0, p1, p2 = [
+        normalize_vertex_to_match_mesh_serialization(
+            coord=coord,
+            fileformat=fileformat,
+            decimals=decimals,
+        )[:2]
+        for coord in triangle
+    ]
+    if len({p0, p1, p2}) < 3:
+        return True
+
+    a = (
+        p1[0] - p0[0],
+        p1[1] - p0[1],
+    )
+    b = (
+        p2[0] - p0[0],
+        p2[1] - p0[1],
+    )
+    cross = round(a[0] * b[1] - a[1] * b[0], 12)
+    return cross == 0.0
+
+
 def polygon_normalized_to_match_mesh_serialization(
     polygon: shapely.Polygon,
     fileformat: str,
@@ -249,6 +278,29 @@ def polygon_normalized_to_match_mesh_serialization(
     ):
         return None
     return shapely.Polygon(exterior, interiors)
+
+
+def surface_polygon_normalized_to_match_mesh_serialization(
+    polygon: shapely.Polygon,
+    fileformat: str,
+    decimals: int = MESH_OUTPUT_SERIALIZATION_DECIMAL_PRECISION,
+) -> shapely.Polygon | None:
+    """Return a serialized surface triangle, or None if it has no area."""
+    normalized_polygon = polygon_normalized_to_match_mesh_serialization(
+        polygon,
+        fileformat,
+        decimals,
+    )
+    if normalized_polygon is None:
+        return None
+
+    if triangle_xy_collapses_after_mesh_serialization(
+        triangle=list(normalized_polygon.exterior.coords)[:3],
+        fileformat=fileformat,
+        decimals=decimals,
+    ):
+        return None
+    return normalized_polygon
 
 
 def _iter_polygon_parts(geometry: shapely.Geometry) -> list[shapely.Polygon]:
@@ -363,9 +415,8 @@ def _z0_adjusted_keep_surface_planes(
     E: float,
     N: float,
     S: float,
-    output_fileformat: str,
 ) -> list[shapely.Polygon]:
-    """Return nudge-adjusted surface triangles with inserted midpoints at Z0."""
+    """Return full-precision nudge-adjusted triangles with Z0 midpoints."""
     vertex_names = _z0_normal_keep_vertex_names(affected_corners)
     if vertex_names is None:
         return []
@@ -398,12 +449,7 @@ def _z0_adjusted_keep_surface_planes(
                 )
             coords_3d.append((x, y, z))
         coords_3d.append(coords_3d[0])
-        normalized_triangle = polygon_normalized_to_match_mesh_serialization(
-            shapely.Polygon(coords_3d),
-            output_fileformat,
-        )
-        if normalized_triangle is not None:
-            planes.append(normalized_triangle)
+        planes.append(shapely.Polygon(coords_3d))
     return planes
 
 
@@ -452,6 +498,7 @@ def _triangulate_2d_geometry_to_3d_polygons(
 
 def _surface_wall_requested_lines(
     surface_polygon_borders: list[quad] | None,
+    output_fileformat: str | None = None,
 ) -> shapely.Geometry | None:
     lines: list[shapely.LineString] = []
     if not surface_polygon_borders:
@@ -461,7 +508,13 @@ def _surface_wall_requested_lines(
         for border_vertex in surface_border.vl:
             if border_vertex is None:
                 continue
-            xy = (border_vertex.coords[0], border_vertex.coords[1])
+            coords = border_vertex.coords
+            if output_fileformat is not None:
+                coords = normalize_vertex_to_match_mesh_serialization(
+                    coords,
+                    output_fileformat,
+                )
+            xy = (coords[0], coords[1])
             if xy not in xy_coords:
                 xy_coords.append(xy)
         if len(xy_coords) == 2:
@@ -469,6 +522,195 @@ def _surface_wall_requested_lines(
     if not lines:
         return None
     return shapely.union_all(lines)
+
+
+def _geometry_boundary_linework(
+    geometry: shapely.Geometry,
+    output_fileformat: str,
+) -> shapely.Geometry | None:
+    lines: list[shapely.LineString] = []
+    for polygon in _iter_polygon_parts(shapely.force_2d(geometry)):
+        for ring in (polygon.exterior, *polygon.interiors):
+            coords = list(ring.coords)
+            for index in range(len(coords) - 1):
+                start = (
+                    normalize_coordinate_to_match_mesh_serialization(
+                        coords[index][0],
+                        output_fileformat,
+                    ),
+                    normalize_coordinate_to_match_mesh_serialization(
+                        coords[index][1],
+                        output_fileformat,
+                    ),
+                )
+                end = (
+                    normalize_coordinate_to_match_mesh_serialization(
+                        coords[index + 1][0],
+                        output_fileformat,
+                    ),
+                    normalize_coordinate_to_match_mesh_serialization(
+                        coords[index + 1][1],
+                        output_fileformat,
+                    ),
+                )
+                if start != end:
+                    lines.append(shapely.LineString((start, end)))
+    if not lines:
+        return None
+    return shapely.union_all(lines)
+
+
+def _linework_covers_footprint(
+    linework: shapely.Geometry | None,
+    footprint: XYEdge,
+) -> bool:
+    return linework is not None and linework.covers(shapely.LineString(footprint))
+
+
+def _split_surface_boundary_edges_for_wall_matches(
+    surfaces: list[shapely.Polygon],
+    boundary_edges: dict[XYEdge, Edge3D],
+    split_vertices_xy: set[tuple[float, float]],
+    footprint_is_requested: Callable[[XYEdge], bool],
+    output_fileformat: str,
+) -> list[shapely.Polygon]:
+    split_surfaces: list[shapely.Polygon] = []
+
+    for surface in surfaces:
+        coords = list(surface.exterior.coords)
+        if len(coords) < 4:
+            continue
+
+        new_coords: list[tuple[float, ...]] = []
+        inserted_point = False
+        for index in range(len(coords) - 1):
+            start = normalize_vertex_to_match_mesh_serialization(
+                coords[index],
+                output_fileformat,
+            )
+            end = normalize_vertex_to_match_mesh_serialization(
+                coords[index + 1],
+                output_fileformat,
+            )
+            footprint = edge_xy_signature(start, end)
+            new_coords.append(start)
+            if footprint not in boundary_edges or not footprint_is_requested(
+                footprint,
+            ):
+                continue
+
+            line = shapely.LineString((start[:2], end[:2]))
+            line_length = line.length
+            if line_length == 0:
+                continue
+
+            split_points: list[tuple[float, tuple[float, float]]] = []
+            for split_xy in split_vertices_xy:
+                if split_xy == start[:2] or split_xy == end[:2]:
+                    continue
+                point = shapely.Point(split_xy)
+                if not line.covers(point):
+                    continue
+                distance = line.project(point)
+                if distance <= 0 or distance >= line_length:
+                    continue
+                split_points.append((distance, split_xy))
+
+            if not split_points:
+                continue
+
+            inserted_point = True
+            for distance, split_xy in sorted(split_points):
+                ratio = distance / line_length
+                z = start[2] + (end[2] - start[2]) * ratio
+                new_coords.append((split_xy[0], split_xy[1], z))
+
+        if not inserted_point:
+            split_surfaces.append(surface)
+            continue
+
+        new_coords.append(new_coords[0])
+        split_footprint = shapely.Polygon([coord[:2] for coord in new_coords])
+        exterior_cw = not shapely.is_ccw(shapely.LinearRing(new_coords))
+        split_surfaces.extend(
+            _triangulate_2d_geometry_to_3d_polygons(
+                split_footprint,
+                [surface],
+                exterior_cw=exterior_cw,
+                output_fileformat=output_fileformat,
+            )
+        )
+
+    return split_surfaces
+
+
+def _rebuild_matching_surface_polygon_borders(
+    top_surfaces: list[shapely.Polygon],
+    bottom_surfaces: list[shapely.Polygon],
+    footprint_is_requested: Callable[[XYEdge], bool],
+    output_fileformat: str,
+) -> list[quad]:
+    top_boundary_edges = boundary_edge_map_from_meshes(
+        top_surfaces,
+        output_fileformat=output_fileformat,
+    )
+    bottom_boundary_edges = boundary_edge_map_from_meshes(
+        bottom_surfaces,
+        output_fileformat=output_fileformat,
+    )
+    split_vertices_xy: set[tuple[float, float]] = set()
+    for boundary_map in (top_boundary_edges, bottom_boundary_edges):
+        for footprint in boundary_map:
+            if footprint_is_requested(footprint):
+                split_vertices_xy.update(footprint)
+
+    if split_vertices_xy:
+        top_surfaces[:] = _split_surface_boundary_edges_for_wall_matches(
+            top_surfaces,
+            top_boundary_edges,
+            split_vertices_xy,
+            footprint_is_requested,
+            output_fileformat,
+        )
+        bottom_surfaces[:] = _split_surface_boundary_edges_for_wall_matches(
+            bottom_surfaces,
+            bottom_boundary_edges,
+            split_vertices_xy,
+            footprint_is_requested,
+            output_fileformat,
+        )
+        top_boundary_edges = boundary_edge_map_from_meshes(
+            top_surfaces,
+            output_fileformat=output_fileformat,
+        )
+        bottom_boundary_edges = boundary_edge_map_from_meshes(
+            bottom_surfaces,
+            output_fileformat=output_fileformat,
+        )
+
+    rebuilt_borders: list[quad] = []
+    for footprint, top_edge in top_boundary_edges.items():
+        if not footprint_is_requested(footprint):
+            continue
+        if footprint not in bottom_boundary_edges:
+            continue
+
+        bottom_edge = bottom_boundary_edges[footprint]
+        top_start_xy = (top_edge[0][0], top_edge[0][1])
+        bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
+        if top_start_xy == bottom_start_xy:
+            bottom_edge = (bottom_edge[1], bottom_edge[0])
+
+        wall = make_wall_without_exact_duplicate_vertices(
+            vertex(*top_edge[1]),
+            vertex(*top_edge[0]),
+            vertex(*bottom_edge[1]),
+            vertex(*bottom_edge[0]),
+            output_fileformat=output_fileformat,
+        )
+        if wall is not None:
+            rebuilt_borders.append(wall)
+    return rebuilt_borders
 
 
 def _z0_rebuild_surface_polygon_borders(
@@ -485,18 +727,14 @@ def _z0_rebuild_surface_polygon_borders(
     output_fileformat: str,
 ) -> list[quad]:
     """Build current-cell walls requested by existing borders after nudging."""
-    top_boundary_edges = boundary_edge_map_from_meshes(
-        top_surfaces,
-        output_fileformat=output_fileformat,
-    )
-    bottom_boundary_edges = boundary_edge_map_from_meshes(
-        bottom_surfaces,
-        output_fileformat=output_fileformat,
-    )
     requested_clipped_lines = _surface_wall_requested_lines(
         previous_surface_polygon_borders,
+        output_fileformat=output_fileformat,
     )
-    footprint_boundary = shapely.force_2d(full_footprint).boundary
+    footprint_boundary = _geometry_boundary_linework(
+        full_footprint,
+        output_fileformat,
+    )
 
     side_values = {
         "N": normalize_coordinate_to_match_mesh_serialization(
@@ -529,45 +767,36 @@ def _z0_rebuild_surface_polygon_borders(
             return "W"
         return None
 
-    rebuilt_borders: list[quad] = []
-    for footprint, top_edge in top_boundary_edges.items():
-        if footprint not in bottom_boundary_edges:
-            continue
+    def footprint_is_requested(footprint: XYEdge) -> bool:
         line = shapely.LineString(footprint)
         side = edge_cardinal_side(footprint)
-        requested = side is not None and borders.get(side) is not False
+        on_footprint_boundary = _linework_covers_footprint(
+            footprint_boundary,
+            footprint,
+        )
+        if side is not None and borders.get(side) is not False:
+            return True
         if (
-            not requested
-            and requested_clipped_lines is not None
+            requested_clipped_lines is not None
             and requested_clipped_lines.covers(line)
         ):
-            requested = True
+            return True
+        if side is None and on_footprint_boundary:
+            return True
         if (
-            not requested
-            and include_normal_cut_edges
+            include_normal_cut_edges
             and side is None
-            and not footprint_boundary.covers(line)
+            and not on_footprint_boundary
         ):
-            requested = True
-        if not requested:
-            continue
+            return True
+        return False
 
-        bottom_edge = bottom_boundary_edges[footprint]
-        top_start_xy = (top_edge[0][0], top_edge[0][1])
-        bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
-        if top_start_xy == bottom_start_xy:
-            bottom_edge = (bottom_edge[1], bottom_edge[0])
-
-        wall = make_wall_without_exact_duplicate_vertices(
-            vertex(*top_edge[1]),
-            vertex(*top_edge[0]),
-            vertex(*bottom_edge[1]),
-            vertex(*bottom_edge[0]),
-            output_fileformat=output_fileformat,
-        )
-        if wall is not None:
-            rebuilt_borders.append(wall)
-    return rebuilt_borders
+    return _rebuild_matching_surface_polygon_borders(
+        top_surfaces,
+        bottom_surfaces,
+        footprint_is_requested,
+        output_fileformat,
+    )
 
 
 # function to calculate the normal for a triangle
@@ -756,7 +985,28 @@ class cell:
         output_fileformat: str,
         split_rotation: int,
     ) -> None:
-        """Remove cell meshes whose vertices merge at output precision."""
+        """Remove cell meshes that collapse at output precision."""
+        def normalize_surface_polygons(
+            surface_polygons: list[shapely.Polygon] | None,
+        ) -> list[shapely.Polygon] | None:
+            if not surface_polygons:
+                return None
+
+            output: list[shapely.Polygon] = []
+            for surface_polygon in surface_polygons:
+                output_polygon = (
+                    surface_polygon_normalized_to_match_mesh_serialization(
+                        surface_polygon,
+                        output_fileformat,
+                    )
+                )
+                if output_polygon is not None:
+                    output.append(output_polygon)
+            return output or None
+
+        had_top_surface_polygons = bool(self.topSurfacePolygons)
+        had_bottom_surface_polygons = bool(self.bottomSurfacePolygons)
+
         if self.topquad is not None:
             self.topquad = quad_normalized_to_match_mesh_serialization(
                 self.topquad,
@@ -792,6 +1042,17 @@ class cell:
                 if output_border is not None:
                     surface_borders.append(output_border)
             self.surfacePolygonBorders = surface_borders or None
+
+        self.topSurfacePolygons = normalize_surface_polygons(
+            self.topSurfacePolygons,
+        )
+        self.bottomSurfacePolygons = normalize_surface_polygons(
+            self.bottomSurfacePolygons,
+        )
+        if had_top_surface_polygons and not self.topSurfacePolygons:
+            self.topquad = None
+        if had_bottom_surface_polygons and not self.bottomSurfacePolygons:
+            self.bottomquad = None
 
         if self.topquad is None and not self.topSurfacePolygons:
             self.bottomquad = None
@@ -964,70 +1225,27 @@ class cell:
         output_fileformat: str | None,
     ) -> None:
         """Rebuild existing clipped wall footprints with shared bottom edges."""
-        requested_footprints: set[XYEdge] = set()
         mesh_fileformat = output_fileformat or "STLb"
-        if self.surfacePolygonBorders:
-            for surface_border in self.surfacePolygonBorders:
-                xy_coords: list[tuple[float, float]] = []
-                for border_vertex in surface_border.vl:
-                    if border_vertex is None:
-                        continue
-                    output_coord = (
-                        normalize_vertex_to_match_mesh_serialization(
-                            border_vertex.coords,
-                            mesh_fileformat,
-                        )
-                    )
-                    xy = (output_coord[0], output_coord[1])
-                    if xy not in xy_coords:
-                        xy_coords.append(xy)
-                if len(xy_coords) == 2:
-                    requested_footprints.add(
-                        edge_xy_signature(xy_coords[0], xy_coords[1])
-                    )
-
-        if not requested_footprints:
+        requested_lines = _surface_wall_requested_lines(
+            self.surfacePolygonBorders,
+            output_fileformat=mesh_fileformat,
+        )
+        if requested_lines is None:
             self.surfacePolygonBorders = None
             return
 
-        top_boundary_edge_map = boundary_edge_map_from_meshes(
-            self.topSurfacePolygons,
-            output_fileformat=mesh_fileformat,
-        )
-        bottom_boundary_edge_map = boundary_edge_map_from_meshes(
-            self.bottomSurfacePolygons,
-            output_fileformat=mesh_fileformat,
-        )
-        missing_top = requested_footprints - set(top_boundary_edge_map)
-        missing_bottom = requested_footprints - set(bottom_boundary_edge_map)
-        if missing_top or missing_bottom:
-            raise RuntimeError(
-                "Shared pair clipped bottom boundaries do not match "
-                f"difference top boundaries. missing_bottom={missing_bottom}, "
-                f"missing_top={missing_top}"
+        self.surfacePolygonBorders = (
+            _rebuild_matching_surface_polygon_borders(
+                self.topSurfacePolygons,
+                self.bottomSurfacePolygons,
+                lambda footprint: _linework_covers_footprint(
+                    requested_lines,
+                    footprint,
+                ),
+                mesh_fileformat,
             )
-
-        rebuilt_borders: list[quad] = []
-        for footprint in requested_footprints:
-            top_edge = top_boundary_edge_map[footprint]
-            bottom_edge = bottom_boundary_edge_map[footprint]
-            top_start_xy = (top_edge[0][0], top_edge[0][1])
-            bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
-            # Keep bottom edge order opposite the top edge for wall quads.
-            if top_start_xy == bottom_start_xy:
-                bottom_edge = (bottom_edge[1], bottom_edge[0])
-
-            wall = make_wall_without_exact_duplicate_vertices(
-                vertex(*top_edge[1]),
-                vertex(*top_edge[0]),
-                vertex(*bottom_edge[1]),
-                vertex(*bottom_edge[0]),
-                output_fileformat=mesh_fileformat,
-            )
-            if wall is not None:
-                rebuilt_borders.append(wall)
-
-        self.surfacePolygonBorders = rebuilt_borders or None
+            or None
+        )
 
     def check_for_tri_cell(self):
         """Returns True if cell has borders on 2 consecutive sides False otherwise.
@@ -1115,18 +1333,6 @@ class cell:
                 output_fileformat,
             )
 
-        def remaining_surface_boundary(
-            surface_polygons: list[shapely.Polygon] | None,
-        ) -> shapely.Geometry | None:
-            # Build the old Shapely boundary representation only for guards.
-            if not surface_polygons:
-                return None
-            polygons_2d = [
-                shapely.force_2d(polygon)
-                for polygon in surface_polygons
-            ]
-            return shapely.union_all(polygons_2d).boundary
-
         def surface_border_footprint(
             surface_border: quad,
         ) -> shapely.LineString | None:
@@ -1157,20 +1363,6 @@ class cell:
                 )
             )
 
-        def edge_3d_signature(
-            coord0: Coordinate,
-            coord1: Coordinate,
-        ) -> Edge3D:
-            # Normalize 3D edge direction so top/bottom edge tests are stable.
-            return tuple(
-                sorted(
-                    (
-                        output_signature(coord0),
-                        output_signature(coord1),
-                    )
-                )
-            )
-
         def polygon_edge_footprints(polygon: shapely.Polygon) -> set[XYEdge]:
             # Collect all XY boundary edges for a removed clipped polygon.
             footprints: set[XYEdge] = set()
@@ -1182,75 +1374,6 @@ class cell:
                         edge_xy_signature(coords[ci], coords[ci + 1])
                     )
             return footprints
-
-        def boundary_edge_map(
-            surface_polygons: list[shapely.Polygon] | None,
-        ) -> dict[XYEdge, Edge3D]:
-            # Count polygon edges; edges seen once are emitted boundaries.
-            edge_counts: dict[XYEdge, int] = {}
-            edge_coords: dict[XYEdge, Edge3D] = {}
-            if not surface_polygons:
-                return {}
-            for polygon in surface_polygons:
-                rings = [polygon.exterior, *polygon.interiors]
-                for ring in rings:
-                    coords = list(ring.coords)
-                    for ci in range(len(coords) - 1):
-                        footprint = edge_xy_signature(
-                            coords[ci],
-                            coords[ci + 1],
-                        )
-                        edge_counts[footprint] = (
-                            edge_counts.get(footprint, 0) + 1
-                        )
-                        edge_coords[footprint] = (
-                            output_signature(coords[ci]),
-                            output_signature(coords[ci + 1]),
-                        )
-            return {
-                footprint: coords
-                for footprint, coords in edge_coords.items()
-                if edge_counts[footprint] == 1
-            }
-
-        def surface_border_has_boundary_edges(
-            surface_border: quad,
-            top_edges: set[Edge3D],
-            bottom_edges: set[Edge3D],
-        ) -> bool:
-            # Confirm a wall's top and bottom 3D edges still exist.
-            vertices = [v for v in surface_border.vl if v is not None]
-            if len(vertices) == 4:
-                top_edge = edge_3d_signature(
-                    vertices[0].coords,
-                    vertices[1].coords,
-                )
-                bottom_edge = edge_3d_signature(
-                    vertices[2].coords,
-                    vertices[3].coords,
-                )
-                return top_edge in top_edges and bottom_edge in bottom_edges
-
-            non_vertical_edges: list[Edge3D] = []
-            # Triangular walls have one top and one bottom non-vertical edge.
-            for ai in range(len(vertices)):
-                for bi in range(ai + 1, len(vertices)):
-                    if (
-                        output_signature(vertices[ai].coords)[:2]
-                        == output_signature(vertices[bi].coords)[:2]
-                    ):
-                        continue
-                    non_vertical_edges.append(
-                        edge_3d_signature(
-                            vertices[ai].coords,
-                            vertices[bi].coords,
-                        )
-                    )
-
-            return (
-                any(edge in top_edges for edge in non_vertical_edges) and
-                any(edge in bottom_edges for edge in non_vertical_edges)
-            )
 
         # Step 2: cardinal quads are cleaned up using the triangles that will
         # actually be emitted for the active split_rotation.
@@ -1485,149 +1608,37 @@ class cell:
                     ti += 1
 
         if removed_surface_polygon:
-            # Step 4: after clipped surface removal, keep or rebuild clipped
-            # walls only where remaining top and bottom polygon boundaries
-            # still expose the same footprint.
-            top_boundary_edge_map = boundary_edge_map(self.topSurfacePolygons)
-            bottom_boundary_edge_map = boundary_edge_map(
-                self.bottomSurfacePolygons,
+            # Step 4: after clipped surface removal, split final top/bottom
+            # boundary edges at each other's wall vertices, then rebuild walls
+            # from exact serialized XY matches.
+            requested_line_parts: list[shapely.Geometry] = [
+                shapely.LineString(footprint)
+                for footprint in removed_surface_edge_footprints
+            ]
+            requested_clipped_lines = _surface_wall_requested_lines(
+                self.surfacePolygonBorders,
+                output_fileformat=output_fileformat,
             )
-            top_boundary_edges = {
-                edge_3d_signature(*edge)
-                for edge in top_boundary_edge_map.values()
-            }
-            bottom_boundary_edges = {
-                edge_3d_signature(*edge)
-                for edge in bottom_boundary_edge_map.values()
-            }
+            if requested_clipped_lines is not None:
+                requested_line_parts.append(requested_clipped_lines)
+            requested_lines = (
+                shapely.union_all(requested_line_parts)
+                if requested_line_parts
+                else None
+            )
 
-            remaining_boundaries = None
-
-            def footprint_covered_by_remaining_boundaries(
-                footprint: shapely.LineString,
-            ) -> bool:
-                # Lazily run the previous Shapely covers check for diagnostics.
-                nonlocal remaining_boundaries
-                if remaining_boundaries is None:
-                    remaining_boundaries = (
-                        remaining_surface_boundary(self.topSurfacePolygons),
-                        remaining_surface_boundary(self.bottomSurfacePolygons),
-                    )
-
-                top_boundary, bottom_boundary = remaining_boundaries
-                return (
-                    top_boundary is not None
-                    and bottom_boundary is not None
-                    and top_boundary.covers(footprint)
-                    and bottom_boundary.covers(footprint)
-                )
-
-            def guard_exact_boundary_lookup(
-                footprint: shapely.LineString,
-                footprint_key: XYEdge,
-                has_exact_top: bool,
-                has_exact_bottom: bool,
-            ) -> None:
-                # Throw if old covers disagrees with exact edge lookup.
-                if not footprint_covered_by_remaining_boundaries(footprint):
-                    return
-
-                raise RuntimeError(
-                    "Clipped wall footprint is covered by remaining surface "
-                    "boundaries but does not match exact boundary edges: "
-                    f"footprint={footprint_key}, "
-                    f"top_exact={has_exact_top}, "
-                    f"bottom_exact={has_exact_bottom}"
-                )
-
-            # Keep only existing clipped walls still backed by both surfaces.
-            new_surface_polygon_borders: list[quad] = []
-            if self.surfacePolygonBorders:
-                for surface_border in self.surfacePolygonBorders:
-                    # Exact XY edge lookup is the optimized normal path.
-                    footprint = surface_border_footprint(surface_border)
-                    if footprint is None:
-                        continue
-
-                    footprint_key = edge_xy_signature(
-                        footprint.coords[0],
-                        footprint.coords[1],
-                    )
-                    has_exact_top = footprint_key in top_boundary_edge_map
-                    has_exact_bottom = (
-                        footprint_key in bottom_boundary_edge_map
-                    )
-                    if not (has_exact_top and has_exact_bottom):
-                        guard_exact_boundary_lookup(
-                            footprint,
-                            footprint_key,
-                            has_exact_top,
-                            has_exact_bottom,
-                        )
-                        continue
-
-                    if surface_border_has_boundary_edges(
-                        surface_border,
-                        top_boundary_edges,
-                        bottom_boundary_edges,
-                    ):
-                        new_surface_polygon_borders.append(surface_border)
-
-            # Track kept wall footprints so rebuilt walls are not duplicated.
-            existing_border_footprints: set[XYEdge] = set()
-            for surface_border in new_surface_polygon_borders:
-                footprint = surface_border_footprint(surface_border)
-                if footprint is not None:
-                    existing_border_footprints.add(
-                        edge_xy_signature(
-                            footprint.coords[0],
-                            footprint.coords[1],
-                        )
-                    )
-
-            # Recreate walls on newly exposed matching top/bottom boundaries.
-            for footprint in removed_surface_edge_footprints:
-                if footprint in existing_border_footprints:
-                    continue
-
-                has_exact_top = footprint in top_boundary_edge_map
-                has_exact_bottom = footprint in bottom_boundary_edge_map
-                if not (has_exact_top and has_exact_bottom):
-                    guard_exact_boundary_lookup(
-                        shapely.LineString(footprint),
+            self.surfacePolygonBorders = (
+                _rebuild_matching_surface_polygon_borders(
+                    self.topSurfacePolygons,
+                    self.bottomSurfacePolygons,
+                    lambda footprint: _linework_covers_footprint(
+                        requested_lines,
                         footprint,
-                        has_exact_top,
-                        has_exact_bottom,
-                    )
-                    continue
-
-                top_edge = top_boundary_edge_map[footprint]
-                bottom_edge = bottom_boundary_edge_map[footprint]
-                top_footprint = edge_xy_signature(top_edge[0], top_edge[1])
-                bottom_footprint = edge_xy_signature(
-                    bottom_edge[0],
-                    bottom_edge[1],
+                    ),
+                    output_fileformat,
                 )
-                if top_footprint != bottom_footprint:
-                    continue
-                top_start_xy = (top_edge[0][0], top_edge[0][1])
-                bottom_start_xy = (bottom_edge[0][0], bottom_edge[0][1])
-                # Keep bottom edge order opposite the top edge for wall quads.
-                if top_start_xy == bottom_start_xy:
-                    bottom_edge = (bottom_edge[1], bottom_edge[0])
-
-                tb_wall = make_wall_without_exact_duplicate_vertices(
-                    vertex(*top_edge[1]),
-                    vertex(*top_edge[0]),
-                    vertex(*bottom_edge[1]),
-                    vertex(*bottom_edge[0]),
-                    output_fileformat=output_fileformat,
-                )
-                if tb_wall is not None:
-                    new_surface_polygon_borders.append(tb_wall)
-                    existing_border_footprints.add(footprint)
-
-            self.surfacePolygonBorders = new_surface_polygon_borders or None
+                or None
+            )
 
 '''
 #profiling decorator
@@ -2404,7 +2415,6 @@ class grid:
                                 E,
                                 N,
                                 S,
-                                output_fileformat,
                             )
                             z0_bottom_planes = _z0_adjusted_keep_surface_planes(
                                 z0_corners,
@@ -2413,7 +2423,6 @@ class grid:
                                 E,
                                 N,
                                 S,
-                                output_fileformat,
                             )
                             z0_planes = quad(
                                 vertex(W, N, 0),
@@ -2444,6 +2453,8 @@ class grid:
                             else:
                                 if self.tile.bottom_surface_provider is not None:
                                     z0_used_bottom_provider = True
+                                if top_bottom_surface_geometries_2D is not None:
+                                    z0_include_normal_cut_edges = True
                                 kept_bottom_polygons = (
                                     _triangulate_2d_geometry_to_3d_polygons(
                                         keep_geometry,
