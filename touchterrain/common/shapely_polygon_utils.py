@@ -33,17 +33,31 @@ def polygons_equal_3d(
     if len(rings_a) != len(rings_b):
         return False
 
-    for ra, rb in zip(rings_a, rings_b):
+    def rings_equal(ra: np.ndarray, rb: np.ndarray) -> bool:
+        """Return True when rings match after rotation or reversal."""
         if ra.shape != rb.shape:
             return False
-        # Rotate rb so its first point matches ra's first point.
-        diffs = np.linalg.norm(rb[:, :2] - ra[0, :2], axis=1)
-        start = int(np.argmin(diffs))
-        rb_rot = np.concatenate([rb[start:], rb[:start]], axis=0)
-        if not (
-            np.array_equal(ra[:, :2], rb_rot[:, :2])
-            and np.array_equal(ra[:, 2], rb_rot[:, 2])
-        ):
+
+        ra_open = ra[:-1]
+        rb_open = rb[:-1]
+        if ra_open.shape != rb_open.shape:
+            return False
+
+        for candidate in (rb_open, rb_open[::-1]):
+            for start in range(len(candidate)):
+                candidate_rot = np.concatenate(
+                    [candidate[start:], candidate[:start]],
+                    axis=0,
+                )
+                if (
+                    np.array_equal(ra_open[:, :2], candidate_rot[:, :2])
+                    and np.array_equal(ra_open[:, 2], candidate_rot[:, 2])
+                ):
+                    return True
+        return False
+
+    for ra, rb in zip(rings_a, rings_b):
+        if not rings_equal(ra, rb):
             return False
     return True
 

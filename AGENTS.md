@@ -47,10 +47,23 @@ Cell creation logic order:
 ## Change guidance
 
 - Reuse or adapt existing classes and functions if the changed logic is relevant.
+- Specifications for more specific program behavior are in the markdown files in `spec` folder.
 - Use existing imported libraries' features for convenience over recreating the same logic.
 - Prefer minimal code changes has long as the code is self documenting and human readable.
   - Add concise comments for each major loop or step that is not immediately clear to a human what is being done.
 - Modified python code must conform to PEP 8, PEP 257, PEP 484
+
+## Development mesh output
+
+- Output meshes into a temporary folder that is organized by folder named after the launch config or mesh name. The meshes should be uncompressed in the folder ready to manual inspection.
+- Clean up temporary folders by removing old development output meshes older than 1 day if not needed for tests anymore.
+
+## Mesh validation after code changes
+
+- Follow `spec/mesh_validation.md` after code changes that affect emitted mesh topology, nudge behavior, clipping, bottom surfaces, or mesh serialization.
+- Default validation command: `conda run -n touchterrain-dev python tools\validate_launch_topology.py --mode nudge --mesh-workers 0 --mesh-timeout-seconds 900`
+- If only validation code changed, rerun validation with `--reuse-dir` pointed at a prior topology validation output folder instead of regenerating meshes.
+- Do not treat mesh topology errors as expected unless the option combination is documented in `spec/mesh_validation.md`.
 
 ## Prompt output to the developer
 

@@ -14,6 +14,35 @@ polygon-clipped cells must be handled. If clipped cells are not handled, a
 nudged square cell can leave a gap or keep a nonmanifold `Z=0` edge where it
 neighbors clipped-boundary geometry.
 
+## Confirmation Criteria
+
+Z=0 nudge confirmation must identify zero-height border/contact cells, not
+every emitted `Z=0` cell and not arbitrary clipped/null raster boundaries.
+
+A cell is confirmed for Z=0 nudging only when all of these are true:
+
+```text
+1. The cell is emitted.
+2. The cell is a Z=0 candidate in the detection raster.
+3. At least one of the cell's interpolation corners has a positive-Z
+   contributing cell.
+```
+
+This selects Z=0 cells that sit next to positive terrain. It excludes deep
+interior Z=0 cells that are completely surrounded by Z=0 or lower cells.
+
+Within a confirmed Z=0 cell, affected corners are the corners that do not have
+a positive-Z contributing cell. These are the outside zero-height contact
+corners to remove from the normal mesh footprint. The all-4-corner case remains
+outside the nudge behavior because it represents a fully surrounded or fully
+zero-contact footprint, not a border/corner transition that needs a local
+inside nudge.
+
+Do not treat an ordinary clipped raster boundary, preclipped null-cell boundary,
+or one-corner clipped footprint as sufficient confirmation by itself. Nudging
+must not move or invent geometry along an external clip/null boundary unless
+the emitted cell also satisfies the Z=0 border/contact criteria above.
+
 Assume the reader already understands how cells, top surfaces, bottom surfaces,
 and walls are generated in TouchTerrain.
 
@@ -273,6 +302,13 @@ Clipped cells use the same affected-corner classification and nudge footprint
 definitions as regular square cells. The difference is that clipped cells start
 from an irregular existing clipped footprint, so the nudge operation is a
 polygon operation rather than a fixed vertex-list rewrite.
+
+The emitted clipped cell footprint is the hard source mask for Z=0 nudge edits.
+If a cell has clipped surface polygons, use their 2D union as the cell
+footprint. Otherwise use the full raster-cell footprint. Every normal keep
+piece and difference complementary patch must be intersected with that emitted
+footprint. Do not synthesize geometry outside the clipped/preclipped raster
+footprint.
 
 The general clipped-cell rule is:
 

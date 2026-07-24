@@ -2,6 +2,7 @@ import shapely
 
 from touchterrain.common.Vertex import vertex
 
+
 class quad:
     """return list of 2 triangles (counterclockwise) per quad
        wall quads will NOT subdivide their quad into subquads if they are too skinny
@@ -9,23 +10,43 @@ class quad:
        stuff in in case we want to re-visit it later.
     """
     # class attribute, use quad.too_skinny_ratio
-    too_skinny_ratio = 0.1 # border quads with a horizontal vs vertical ratio smaller than this will be subdivided
-    
+    too_skinny_ratio = 0.1
+    """Border quads below this horizontal-vs-vertical ratio are subdivided."""
+    _default_split_edge: tuple[int, int] = (0, 2)
+    _rotated_split_edge: tuple[int, int] = (1, 3)
+
     vl: list[vertex] = []
     """Vertices mapping        NW SW SE NE
     - Top                      0  1  2  3
     - Bottom                   0  3  2  1
     """
+    forced_split_edge: tuple[int, int] | None
+    """Optional internal diagonal override for paired mesh split alignment."""
 
-    # can be just a triangle, if it just any 3 ccw consecutive corners 
-    def __init__(self, v0, v1, v2, v3=None): 
+    # can be just a triangle, if it just any 3 ccw consecutive corners
+    def __init__(
+        self,
+        v0,
+        v1,
+        v2,
+        v3=None,
+        forced_split_edge: tuple[int, int] | None = None,
+    ):
         self.vl = [v0, v1, v2, v3]
-        self.subdivide_by = None # if not None, we need to subdivide the quad into that many subquads
+        self.forced_split_edge = forced_split_edge
+        # If not None, subdivide the quad into this many subquads.
+        self.subdivide_by = None
 
     def get_copy(self):
         ''' returns a copy of the quad'''
         vl = self.vl[:]
-        cp = quad(vl[0], vl[1], vl[2], vl[3])
+        cp = quad(
+            vl[0],
+            vl[1],
+            vl[2],
+            vl[3],
+            forced_split_edge=self.forced_split_edge,
+        )
         return cp
 
     def check_if_too_skinny(self, direction):
@@ -51,34 +72,57 @@ class quad:
             sb = int(quad.too_skinny_ratio / ratio)
             self.subdivide_by = sb
 
-    def get_triangles(self, split_rotation: int=0) -> list[tuple[vertex,...]]:
+    def get_split_edge_indices(
+        self,
+        split_rotation: int = 0,
+    ) -> tuple[int, int]:
+        """Return the internal diagonal vertex indexes for this quad."""
+        v0, v1, v2, v3 = self.vl[0], self.vl[1], self.vl[2], self.vl[3]
+
+        if v3 is None:
+            return quad._default_split_edge
+
+        if self.forced_split_edge is not None:
+            return self.forced_split_edge
+
+        if split_rotation != 1 and split_rotation != 2:
+            return quad._default_split_edge
+
+        splitting_edge_slope_1 = abs(v0.coords[2] - v2.coords[2])
+        splitting_edge_slope_2 = abs(v1.coords[2] - v3.coords[2])
+        if split_rotation == 1:
+            if splitting_edge_slope_1 > splitting_edge_slope_2:
+                return quad._rotated_split_edge
+        elif split_rotation == 2:
+            if splitting_edge_slope_1 < splitting_edge_slope_2:
+                return quad._rotated_split_edge
+        else:
+            print(f"Invalid split_rotation config value of {split_rotation}")
+
+        return quad._default_split_edge
+
+    def get_triangles(
+        self,
+        split_rotation: int = 0,
+    ) -> list[tuple[vertex, ...]]:
         "return list of 2 triangles (counterclockwise)"
-        v0,v1,v2,v3 = self.vl[0],self.vl[1],self.vl[2],self.vl[3]
+        v0, v1, v2, v3 = self.vl[0], self.vl[1], self.vl[2], self.vl[3]
         t0 = (v0, v1, v2)  # verts of first triangle
 
         # if v3 is None, we only return t0
         if v3 is None:
             return [t0]
 
-        t1 = (v0, v2, v3)  # verts of second triangle
-        
-        if split_rotation != 1 and split_rotation != 2:
-            return [t0,t1]
-        
-        splitting_edge_slope_1 = abs(v0.coords[2] - v2.coords[2])
-        splitting_edge_slope_2 = abs(v1.coords[2] - v3.coords[2])
-        if split_rotation == 1:
-            if splitting_edge_slope_1 > splitting_edge_slope_2:
-                t0 = (v0, v1, v3)
-                t1 = (v1, v2, v3)
-        elif split_rotation == 2:
-            if splitting_edge_slope_1 < splitting_edge_slope_2:
-                t0 = (v0, v1, v3)
-                t1 = (v1, v2, v3)
-        else:
-            print(f"Invalid split_rotation config value of {split_rotation}")
+        if (
+            self.get_split_edge_indices(split_rotation)
+            == quad._rotated_split_edge
+        ):
+            t0 = (v0, v1, v3)
+            t1 = (v1, v2, v3)
+            return [t0, t1]
 
-        return [t0,t1]
+        t1 = (v0, v2, v3)  # verts of second triangle
+        return [t0, t1]
 
     def get_triangles_in_tuple_float(self, split_rotation: int) -> list[tuple[tuple[float, ...], ...]]:
         # convert Vertex objects in the tri to tuple[float, ...]

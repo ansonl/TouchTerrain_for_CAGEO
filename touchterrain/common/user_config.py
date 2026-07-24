@@ -74,12 +74,16 @@ class TouchTerrainConfig:
     interlocking_mesh_pair = False
     """Create paired lower-normal and difference meshes in one run.
 
-    The pair is generated using the existing single-mesh generators.
+    This is the supported mode for interlocking normal/difference meshes when
+    nudging is enabled.
     """
     nudge_in_overused_edges_vertex: bool = False
-    """Enable Z=0 overused-edge corner nudging.
+    """Enable Z=0 and positive-Z overused-edge corner nudging.
 
-    This is ignored when ``no_bottom=True``.
+    This is ignored when ``no_bottom=True``. Positive-Z nudging for ordinary
+    ``bottom_elevation`` meshes requires ``interlocking_mesh_pair=True`` so the
+    normal and difference meshes share the same nudge decisions. Through-base
+    bottom meshes use their existing standalone path.
     """
     max_cells_for_memory_only = 500 * 500 * 4
     "if total number of cells is bigger, use temp_file instead using memory only"

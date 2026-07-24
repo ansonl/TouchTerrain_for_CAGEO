@@ -1,16 +1,20 @@
+import functools
+import logging
+import multiprocessing
+import os
+import warnings
+from typing import TypeAlias
+
 import geopandas
 import numpy
+import pyproj
 import shapely
-import os
-import multiprocessing
-import functools
 from shapely.ops import unary_union
-import logging
 
 # try to import gdal from multiple sources
 try:
     import gdal
-except ImportError as err:
+except ImportError:
     from osgeo import gdal
 
 from touchterrain.common.BorderEdge import BorderEdge
@@ -18,10 +22,22 @@ from touchterrain.common.RasterVariants import RasterVariants
 from touchterrain.common.user_config import TouchTerrainConfig
 from touchterrain.common.utils import geoCoordToPrint2DCoord, arrayCellCoordToQuadPrint2DCoords
 from touchterrain.common.shapely_utils import flatten_geometries, flatten_geometries_borderEdge, sort_line_segment_based_contains
-from touchterrain.common.shapely_plot import plot_intersection_of_shapely_polygons
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+EdgeBuckets: TypeAlias = dict[str, list[BorderEdge]]
+PolygonClipUpdates: TypeAlias = tuple[
+    list[tuple[int, int]],
+    list[tuple[int, int, list[shapely.Geometry]]],
+    list[tuple[int, int, EdgeBuckets]],
+    list[tuple[int, int]],
+]
+EDGE_BUCKET_KEYS = ("N", "W", "S", "E", "other")
+
+
+def _empty_edge_buckets() -> EdgeBuckets:
+    return {key: [] for key in EDGE_BUCKET_KEYS}
 
 
 def _log_info(msg: str) -> None:
@@ -31,13 +47,86 @@ def _log_info(msg: str) -> None:
     else:
         print(msg)
 
+
+def _polygon_parts(geometry: shapely.Geometry) -> list[shapely.Polygon]:
+    """Return non-empty polygon parts from a Shapely geometry."""
+    if geometry.is_empty:
+        return []
+    if isinstance(geometry, shapely.Polygon):
+        return [geometry] if geometry.area > 0 else []
+    polygons: list[shapely.Polygon] = []
+    if hasattr(geometry, "geoms"):
+        for child in geometry.geoms:
+            polygons.extend(_polygon_parts(child))
+    return polygons
+
+
+def _union_clipping_polygons(
+    polygons: list[shapely.Polygon],
+) -> list[shapely.Polygon]:
+    """Return polygon parts for the unioned clipping footprint."""
+    if not polygons:
+        return []
+    return _polygon_parts(shapely.union_all(polygons))
+
+
+def _geodataframe_has_finite_geometry(
+    polygon_boundary_gdf: geopandas.GeoDataFrame,
+) -> bool:
+    for geometry in polygon_boundary_gdf.geometry:
+        if geometry is None or geometry.is_empty:
+            continue
+        if not all(numpy.isfinite(value) for value in geometry.bounds):
+            return False
+    return True
+
+
+def _nad83_projection_fallbacks(
+    target_crs: pyproj.CRS,
+) -> list[tuple[str, pyproj.CRS]]:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        proj4 = target_crs.to_proj4()
+    fallbacks = [("original PROJ string", pyproj.CRS.from_proj4(proj4))]
+    if "+datum=NAD83" in proj4:
+        fallbacks.append(
+            (
+                "NAD83 ellipsoid",
+                pyproj.CRS.from_proj4(
+                    proj4.replace("+datum=NAD83", "+ellps=GRS80")
+                ),
+            )
+        )
+    return fallbacks
+
+
+def _project_polygon_boundary_gdf(
+    polygon_boundary_gdf: geopandas.GeoDataFrame,
+    dem_projection: str,
+) -> geopandas.GeoDataFrame:
+    projected_gdf = polygon_boundary_gdf.to_crs(dem_projection)
+    if _geodataframe_has_finite_geometry(projected_gdf):
+        return projected_gdf
+
+    target_crs = pyproj.CRS.from_wkt(dem_projection)
+    for fallback_name, fallback_crs in _nad83_projection_fallbacks(target_crs):
+        fallback_gdf = polygon_boundary_gdf.to_crs(fallback_crs)
+        if _geodataframe_has_finite_geometry(fallback_gdf):
+            _log_info(
+                f"Reprojected clipping polygon with {fallback_name} fallback "
+                "after DEM WKT transform produced non-finite coordinates."
+            )
+            return fallback_gdf
+    return projected_gdf
+
+
 def _process_polygon_clip_cell(
     i: int,
     j: int,
     clipping_print2d_polys: list[shapely.Polygon],
     cell_size_mm: float,
     tile_y_shape: int,
-) -> tuple[bool, list[shapely.Geometry], dict[str, list[BorderEdge]] | None, bool]:
+) -> tuple[bool, list[shapely.Geometry], EdgeBuckets | None, bool]:
     """Collect clipping results based on intersection between a single cell and clipping poly."""
     quadPrint2DCoords = arrayCellCoordToQuadPrint2DCoords(
         array_coord_2D=(i, j),
@@ -46,17 +135,11 @@ def _process_polygon_clip_cell(
     )
 
     cell_disjoint = True
-    cell_polygon_intersection_geometry = []
-    cell_polygon_intersection_edge_buckets = None
+    cell_polygon_intersection_geometry: list[shapely.Geometry] = []
+    cell_polygon_intersection_edge_buckets: EdgeBuckets | None = None
     cell_contains_properly = False
 
     for clippingPrint2DPoly in clipping_print2d_polys:
-        
-        # Debug plot of a clipping and cell polygon intersection
-        # if j==1 and i==6:
-        #     quadPrint2DPoly = shapely.Polygon(quadPrint2DCoords)
-        #     plot_intersection_of_shapely_polygons([clippingPrint2DPoly, quadPrint2DPoly])
-        #     pass
         
         disjoint, intersection_geoms, intersection_edges, contains_properly = find_intersection_geometries(
             clippingPrint2DPoly=clippingPrint2DPoly,
@@ -73,7 +156,7 @@ def _process_polygon_clip_cell(
         # Add to cell's "all intersection geometries flattened to single edges and sorted into buckets in a dict"
         if intersection_edges:
             if cell_polygon_intersection_edge_buckets is None:
-                cell_polygon_intersection_edge_buckets = {'N': [], 'W': [], 'S': [], 'E': [], 'other': []}
+                cell_polygon_intersection_edge_buckets = _empty_edge_buckets()
             for k, v in intersection_edges.items():
                 cell_polygon_intersection_edge_buckets[k].extend(v)
                 
@@ -89,12 +172,7 @@ def _process_polygon_clip_rows(
     cell_size_mm: float,
     tile_y_shape: int,
     grid_width: int,
-) -> tuple[
-    list[tuple[int, int]],
-    list[tuple[int, int, list[shapely.Geometry]]],
-    list[tuple[int, int, dict[str, list[BorderEdge]]]],
-    list[tuple[int, int]],
-]:
+) -> PolygonClipUpdates:
     """Get cell and clipping poly intersection results for a range of rows.
     Worker can run this to process a chunk of rows. Returns lists of update info to apply in main process."""
     start_row, end_row = row_range
@@ -129,12 +207,7 @@ def _process_polygon_clip_rows(
 def _apply_polygon_clip_updates(
     surface_raster_variant: list[RasterVariants],
     top_hint: numpy.ndarray | None,
-    updates: tuple[
-        list[tuple[int, int]],
-        list[tuple[int, int, list[shapely.Geometry]]],
-        list[tuple[int, int, dict[str, list[BorderEdge]]]],
-        list[tuple[int, int]],
-    ],
+    updates: PolygonClipUpdates,
 ) -> None:
     """Apply passed updates to the first RasterVariant.
     :param updates: Updates to the RasterVariant as a tuple of lists. Each list contains tuples with the cell location to update and any update data. Lists are in order of disjoint cells, polygon_intersection_geometry, polygon_intersection_edge_buckets, polygon_intersection_contains_properly
@@ -156,7 +229,10 @@ def _apply_polygon_clip_updates(
     for j, i in polygon_intersection_contains_properly_updates:
         surface_raster_variant[0].polygon_intersection_contains_properly[j][i] = True
 
-def find_intersection_geometries(clippingPrint2DPoly: shapely.Polygon, quadPrint2DCoords: list[tuple[float, float]]) -> tuple[bool, list[shapely.Geometry] | None, dict[str, list[BorderEdge]] | None, bool]:
+def find_intersection_geometries(
+    clippingPrint2DPoly: shapely.Polygon,
+    quadPrint2DCoords: list[tuple[float, float]],
+) -> tuple[bool, list[shapely.Geometry] | None, EdgeBuckets | None, bool]:
     """Check if clipping polygon and cell polygon have no/partial/complete overlap. Return whether to set the cell to NaN, intersection polygons, intersection edges. 
     
     Returned intersection edges are a flat list of all edges making up the intersection polygons sorted into buckets depending on them lying on a specific cardinal edge or not.
@@ -188,7 +264,6 @@ def find_intersection_geometries(clippingPrint2DPoly: shapely.Polygon, quadPrint
         if len(flat_intersection_geometries) == 0:
             print("find_intersection_geometries: only point intersection geometries found")
             #surface_raster_variant.polygon_intersection_geometry[j][i] = flat_intersection_geometries
-            pass
             
         #intersection geometry as a list of single line segments
         flat_intersection_borderEdges = flatten_geometries_borderEdge([intersection_geometry])
@@ -201,12 +276,7 @@ def find_intersection_geometries(clippingPrint2DPoly: shapely.Polygon, quadPrint
         quadPrint2DEastEdge = shapely.LineString([list(quadPrint2DCoords[2]),list(quadPrint2DCoords[3])])
         
         # sort every lines into buckets based on if the quad edge contains them
-        intersection_edge_buckets = { 
-                                        'N': [],
-                                        'W': [],
-                                        'S': [],
-                                        'E': [],
-                                        'other': [],}
+        intersection_edge_buckets = _empty_edge_buckets()
         for be in flat_intersection_borderEdges:
             bucket_key = sort_line_segment_based_contains(line_segment=be, north=quadPrint2DNorthEdge, west=quadPrint2DWestEdge, south=quadPrint2DSouthEdge, east=quadPrint2DEastEdge)
             
@@ -220,53 +290,6 @@ def find_intersection_geometries(clippingPrint2DPoly: shapely.Polygon, quadPrint
             
         return (False, flat_intersection_geometries, intersection_edge_buckets, polygon_intersection_contains_properly)
 
-# def find_cell_and_clipping_poly_intersection(surface_raster_variant: list[RasterVariants], cellLocation: tuple[int, int], clippingPrint2DPoly: shapely.Polygon, quadPrint2DCoords: list[tuple[float, float]], top_hint: numpy.ndarray|None) -> bool:
-#     """
-#     :return: Should set cell value to NaN
-#     :rtype: bool
-#     """
-    
-#     if cellLocation[0] == 124 and cellLocation[1] == 0:
-#         pass
-    
-#     intersection_geometries_result = find_intersection_geometries(clippingPrint2DPoly=clippingPrint2DPoly, quadPrint2DCoords=quadPrint2DCoords)
-          
-#     # Debug: stop here to inspect intersection geometry result for a polygon and the cell 
-#     if cellLocation[0] == 1 and cellLocation[1] == 6:
-#         pass
-                    
-#     # Should set cell values to NaN # we set the cell values to NaN outside this function after evaluating all clipping polygons in case there are multiple polygons
-#     # if intersection_geometries_result[0]:
-#     #     #surface_raster_variant.set_location_in_variants(location=cellLocation, new_value=numpy.nan, set_edge_interpolation=False)
-#     #     for rv in surface_raster_variant: # Set the location to NaN in all raster variants (top and bottom) to get the same interpolation values between normal/difference modes
-#     #         rv.set_location_in_variants(location=cellLocation, new_value=numpy.nan, set_edge_interpolation=False)
-#     #     if top_hint is not None:
-#     #         top_hint[cellLocation[0]][cellLocation[1]] = numpy.nan
-    
-#     # Add to cell's"all intersection geometries flattened to polygons"
-#     if intersection_geometries_result[1] is not None:
-#         if surface_raster_variant[0].polygon_intersection_geometry[cellLocation[0]][cellLocation[1]] is None:
-#             surface_raster_variant[0].polygon_intersection_geometry[cellLocation[0]][cellLocation[1]] = []
-#         surface_raster_variant[0].polygon_intersection_geometry[cellLocation[0]][cellLocation[1]].extend(intersection_geometries_result[1])
-            
-        
-#     # Add to cell's "all intersection geometries flattened to single edges and sorted into buckets in a dict"
-#     if intersection_geometries_result[2] is not None:
-#         if surface_raster_variant[0].polygon_intersection_edge_buckets[cellLocation[0]][cellLocation[1]] is None:
-#             surface_raster_variant[0].polygon_intersection_edge_buckets[cellLocation[0]][cellLocation[1]] = {}
-#         # merge bucket dictionaries and lists
-#         for k, v in intersection_geometries_result[2].items():
-#             if k in surface_raster_variant[0].polygon_intersection_edge_buckets[cellLocation[0]][cellLocation[1]]:
-#                 surface_raster_variant[0].polygon_intersection_edge_buckets[cellLocation[0]][cellLocation[1]][k].extend(v)
-#             else:
-#                 surface_raster_variant[0].polygon_intersection_edge_buckets[cellLocation[0]][cellLocation[1]][k] = v
-        
-#     # Set cell's polygon_intersection_contains_properly
-#     if intersection_geometries_result[3]:
-#         surface_raster_variant[0].polygon_intersection_contains_properly[cellLocation] = intersection_geometries_result[3]
-        
-#     return intersection_geometries_result[0]
-    
 def find_polygon_clipping_edges(config: TouchTerrainConfig, dem: gdal.Dataset, surface_raster_variant: list[RasterVariants], top_hint: numpy.ndarray|None, print3D_resolution_mm: float):
     """Find the intersection polygon between each raster cell and the clipping polygon. Sort all individual edges of intersection polygons into buckets stored in RasterVariants based on if the edge lies on a cardinal direction edge of the cell quad. Marks all interior edges as needing walls created. 
     
@@ -286,7 +309,10 @@ def find_polygon_clipping_edges(config: TouchTerrainConfig, dem: gdal.Dataset, s
     polygon_boundary_gdf = geopandas.read_file(config.edge_clipping_polygon)
 
     # reproject vector boundary to same projected CRS as raster
-    polygon_boundary_gdf = polygon_boundary_gdf.to_crs(dem.GetProjectionRef())
+    polygon_boundary_gdf = _project_polygon_boundary_gdf(
+        polygon_boundary_gdf,
+        dem.GetProjectionRef(),
+    )
 
     # Initialize an empty list to store boundary Shapely Polygon objects
     shapely_polygons: list[shapely.Polygon] = []
@@ -344,6 +370,10 @@ def find_polygon_clipping_edges(config: TouchTerrainConfig, dem: gdal.Dataset, s
                     clipping_print2d_polys.append(geom)
         else:
             print("clippingPrint2DPoly is not a shapely Polygon")
+
+    clipping_print2d_polys = _union_clipping_polygons(
+        clipping_print2d_polys,
+    )
 
     # determine intersection for polygon(s) in boundary and each cell quad
     rows = surface_raster_variant[0].original.shape[0]
@@ -487,10 +517,6 @@ def mark_shared_edges_of_cell_for_walls(polygon_intersection_edge_buckets: numpy
     :param direction: Direction of neighboring cell in Y,X order
     :type direction: tuple[int, int]
     """
-    
-    # Debug: inspect a cell
-    if cell_location[0] == 1 and cell_location[1] == 7:
-        pass
     
     cell_1_edge_buckets: dict[str, list[BorderEdge]] = polygon_intersection_edge_buckets[cell_location]
     # Get 2 separate cell "2"s, one in vertical direction, one in horizontal direction

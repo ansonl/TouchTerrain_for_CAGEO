@@ -28,6 +28,7 @@ import socket
 import sys
 import urllib.request, urllib.error, urllib.parse
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Union, Any, cast
 from zipfile import ZipFile
 
@@ -47,6 +48,10 @@ import touchterrain.common
 from touchterrain.common.grid_tesselate import (
     BottomSurfaceProvider,
     ProcessingTile,
+    _build_positive_z_nudge_plan,
+    _cleanup_cells_for_mesh_serialization,
+    _filter_positive_z_nudge_plan_to_actual_overused_edges,
+    _single_job_parallel_workers,
     grid,
 )
 from touchterrain.common.user_config import TouchTerrainConfig
@@ -135,6 +140,55 @@ def pr(*arglist):
         s = s + str(a) + " "
     print(s)
     logger.info(s)
+
+
+def _finalize_deferred_grid_buffer(
+    mesh_grid: grid,
+    parallel_cleanup_workers: int | None = None,
+) -> tuple[bytes | str, float]:
+    """Write an existing grid and return its buffer/path plus size in MiB."""
+    buffer = mesh_grid.make_file_buffer(
+        create_cells=False,
+        parallel_cleanup_workers=parallel_cleanup_workers,
+    )
+    size_mb = (
+        os.stat(buffer).st_size / float(1024 * 1024)
+        if isinstance(buffer, str)
+        else len(buffer) / float(1024 * 1024)
+    )
+    return buffer, size_mb
+
+
+def _finalize_pair_buffers(
+    normal_grid: grid,
+    difference_grid: grid,
+    config: TouchTerrainConfig,
+) -> tuple[bytes | str, float, bytes | str, float]:
+    """Finalize normal and difference buffers, parallel when it is safe."""
+    workers = _single_job_parallel_workers(config, task_count=2)
+    if workers <= 1:
+        normal_buffer, normal_size = _finalize_deferred_grid_buffer(
+            normal_grid,
+        )
+        difference_buffer, difference_size = _finalize_deferred_grid_buffer(
+            difference_grid,
+        )
+        return normal_buffer, normal_size, difference_buffer, difference_size
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        normal_future = executor.submit(
+            _finalize_deferred_grid_buffer,
+            normal_grid,
+            1,
+        )
+        difference_future = executor.submit(
+            _finalize_deferred_grid_buffer,
+            difference_grid,
+            1,
+        )
+        normal_buffer, normal_size = normal_future.result()
+        difference_buffer, difference_size = difference_future.result()
+    return normal_buffer, normal_size, difference_buffer, difference_size
 
 
 # Use zig-zag magic?
@@ -1375,6 +1429,7 @@ def _get_interlocking_pair_zipped_tiles(
                     "missing."
                 )
 
+            missing_bottom_mask = numpy.zeros_like(emit_raster, dtype=bool)
             for row_index, provider_row in enumerate(bottom_provider):
                 raster_y = row_index + 1
                 for col_index, provider_surface in enumerate(provider_row):
@@ -1386,10 +1441,19 @@ def _get_interlocking_pair_zipped_tiles(
                     if numpy.isnan(emit_raster[raster_y, raster_x]):
                         continue
 
-                    bottom_variants.set_location_in_variants(
-                        (raster_y, raster_x),
-                        bottom_floor_elev,
-                    )
+                    missing_bottom_mask[raster_y, raster_x] = True
+
+            if not missing_bottom_mask.any():
+                return
+
+            for raster in (
+                bottom_variants.original,
+                bottom_variants.nan_close,
+                bottom_variants.dilated,
+                bottom_variants.edge_interpolation,
+            ):
+                if raster is not None:
+                    raster[missing_bottom_mask] = bottom_floor_elev
 
         total_mesh_size_mb = 0.0
         with ZipFile(final_zip_file_name, "w", allowZip64=True) as output_zip:
@@ -1433,25 +1497,11 @@ def _get_interlocking_pair_zipped_tiles(
                 normal_tile_info = copy.deepcopy(normal_base_tile_info)
                 normal_tile_info.tile_no_x = tx + 1
                 normal_tile_info.tile_no_y = ty + 1
-                normal_tile = ProcessingTile(
-                    tile_info=normal_tile_info,
-                    top=tile_normal_top,
-                    bottom=tile_normal_bottom,
-                    return_grid=True,
+                difference_tile_info = copy.deepcopy(
+                    difference_base_tile_info,
                 )
-                normal_result = process_tile(normal_tile)
-                normal_processed_info, normal_buffer, normal_grid = (
-                    normal_result
-                )
-                if normal_buffer is None:
-                    raise RuntimeError(
-                        "Interlocking pair normal tile generated no mesh "
-                        f"for tile {tx + 1}, {ty + 1}."
-                    )
-
-                bottom_surface_provider = (
-                    normal_grid.extract_emitted_top_bottom_surfaces()
-                )
+                difference_tile_info.tile_no_x = tx + 1
+                difference_tile_info.tile_no_y = ty + 1
                 difference_emit_raster = tile_difference_top.dilated
                 if (
                     difference_config.bottom_thru_base
@@ -1462,31 +1512,191 @@ def _get_interlocking_pair_zipped_tiles(
                     raise RuntimeError(
                         "Interlocking pair difference emit raster is missing."
                     )
-                fill_missing_raster_bottoms(
-                    tile_difference_bottom,
-                    difference_emit_raster,
-                    bottom_surface_provider,
+
+                positive_z_nudge_plan = {}
+                pair_nudge_enabled = (
+                    normal_tile_info.config.nudge_in_overused_edges_vertex
+                    and not normal_tile_info.config.no_bottom
                 )
 
-                difference_tile_info = copy.deepcopy(
-                    difference_base_tile_info,
-                )
-                difference_tile_info.tile_no_x = tx + 1
-                difference_tile_info.tile_no_y = ty + 1
-                difference_tile = ProcessingTile(
-                    tile_info=difference_tile_info,
-                    top=tile_difference_top,
-                    bottom=tile_difference_bottom,
-                    bottom_surface_provider=bottom_surface_provider,
-                )
-                difference_processed_info, difference_buffer = process_tile(
-                    difference_tile,
-                )
-                if difference_buffer is None:
-                    raise RuntimeError(
-                        "Interlocking pair difference tile generated no mesh "
-                        f"for tile {tx + 1}, {ty + 1}."
+                if pair_nudge_enabled:
+                    normal_tile = ProcessingTile(
+                        tile_info=normal_tile_info,
+                        top=tile_normal_top,
+                        bottom=tile_normal_bottom,
+                        return_grid=True,
+                        defer_triangle_writes=True,
+                        defer_serialization_cleanup=True,
                     )
+                    normal_result = process_tile(normal_tile)
+                    normal_processed_info, normal_buffer, normal_grid = (
+                        normal_result
+                    )
+                    if normal_grid.cells is None:
+                        continue
+
+                    bottom_surface_provider = (
+                        normal_grid.extract_emitted_top_bottom_surfaces()
+                    )
+                    fill_missing_raster_bottoms(
+                        tile_difference_bottom,
+                        difference_emit_raster,
+                        bottom_surface_provider,
+                    )
+
+                    difference_tile = ProcessingTile(
+                        tile_info=difference_tile_info,
+                        top=tile_difference_top,
+                        bottom=tile_difference_bottom,
+                        bottom_surface_provider=bottom_surface_provider,
+                        positive_z_nudge_plan={},
+                        return_grid=True,
+                        defer_triangle_writes=True,
+                        defer_serialization_cleanup=True,
+                    )
+                    difference_result = process_tile(difference_tile)
+                    (
+                        difference_processed_info,
+                        difference_buffer,
+                        difference_grid,
+                    ) = difference_result
+                    if difference_grid.cells is None:
+                        raise RuntimeError(
+                            "Interlocking pair difference tile generated no "
+                            f"mesh for tile {tx + 1}, {ty + 1}."
+                        )
+                    difference_top_footprints = (
+                        difference_grid.extract_emitted_top_footprints()
+                    )
+
+                    lower_positive_raster = (
+                        tile_normal_top.edge_interpolation
+                        if (
+                            normal_grid.tile_info.have_nan
+                            and tile_normal_top.edge_interpolation is not None
+                        )
+                        else tile_normal_top.dilated
+                    )
+                    positive_contact_top_raster = (
+                        tile_difference_top.edge_interpolation
+                        if tile_difference_top.edge_interpolation is not None
+                        else tile_difference_top.dilated
+                    )
+                    candidate_positive_z_plan = _build_positive_z_nudge_plan(
+                        upper_raster=positive_contact_top_raster,
+                        lower_raster=lower_positive_raster,
+                        emit_raster=difference_emit_raster,
+                        split_emit_raster=tile_normal_top.dilated,
+                        cell_size=normal_grid.cell_size,
+                        offsetx=normal_grid.offsetx,
+                        offsety=normal_grid.offsety,
+                        split_rotation=(
+                            normal_tile_info.config.split_rotation
+                        ),
+                        ymaxidx=normal_grid.ymaxidx,
+                        xmaxidx=normal_grid.xmaxidx,
+                        zero_threshold=normal_tile_info.config.basethick,
+                        output_fileformat=normal_tile_info.config.fileformat,
+                        parallel_workers=_single_job_parallel_workers(
+                            normal_tile_info.config,
+                            normal_grid.ymaxidx,
+                        ),
+                    )
+                    confirmation_cells = copy.deepcopy(difference_grid.cells)
+                    _cleanup_cells_for_mesh_serialization(
+                        confirmation_cells,
+                        normal_tile_info.config.fileformat,
+                        normal_tile_info.config.split_rotation,
+                        _single_job_parallel_workers(
+                            normal_tile_info.config,
+                            confirmation_cells.shape[0],
+                        ),
+                    )
+
+                    positive_z_nudge_plan = (
+                        _filter_positive_z_nudge_plan_to_actual_overused_edges(
+                            candidate_positive_z_plan,
+                            confirmation_cells,
+                            normal_grid.cell_size,
+                            normal_grid.offsetx,
+                            normal_grid.offsety,
+                            normal_tile_info.config.split_rotation,
+                            normal_tile_info.config.fileformat,
+                            parallel_workers=_single_job_parallel_workers(
+                                normal_tile_info.config,
+                                normal_grid.ymaxidx,
+                            ),
+                        )
+                    )
+
+                    if positive_z_nudge_plan:
+                        normal_grid.apply_positive_z_plan_to_existing_cells(
+                            positive_z_nudge_plan,
+                            positive_contact_top_raster=(
+                                positive_contact_top_raster
+                            ),
+                            positive_z_difference_top_footprints=(
+                                difference_top_footprints
+                            ),
+                        )
+
+                        bottom_surface_provider = (
+                            normal_grid.extract_emitted_top_bottom_surfaces()
+                        )
+                        difference_grid.tile.bottom_surface_provider = (
+                            bottom_surface_provider
+                        )
+                        difference_grid.apply_positive_z_plan_to_existing_cells(
+                            positive_z_nudge_plan,
+                        )
+
+                    (
+                        normal_buffer,
+                        normal_processed_info.file_size,
+                        difference_buffer,
+                        difference_processed_info.file_size,
+                    ) = _finalize_pair_buffers(
+                        normal_grid,
+                        difference_grid,
+                        normal_tile_info.config,
+                    )
+                else:
+                    normal_tile = ProcessingTile(
+                        tile_info=normal_tile_info,
+                        top=tile_normal_top,
+                        bottom=tile_normal_bottom,
+                        return_grid=True,
+                    )
+                    normal_result = process_tile(normal_tile)
+                    normal_processed_info, normal_buffer, normal_grid = (
+                        normal_result
+                    )
+                    if normal_buffer is None:
+                        continue
+
+                    bottom_surface_provider = (
+                        normal_grid.extract_emitted_top_bottom_surfaces()
+                    )
+                    fill_missing_raster_bottoms(
+                        tile_difference_bottom,
+                        difference_emit_raster,
+                        bottom_surface_provider,
+                    )
+
+                    difference_tile = ProcessingTile(
+                        tile_info=difference_tile_info,
+                        top=tile_difference_top,
+                        bottom=tile_difference_bottom,
+                        bottom_surface_provider=bottom_surface_provider,
+                    )
+                    difference_processed_info, difference_buffer = (
+                        process_tile(difference_tile)
+                    )
+                    if difference_buffer is None:
+                        raise RuntimeError(
+                            "Interlocking pair difference tile generated no "
+                            f"mesh for tile {tx + 1}, {ty + 1}."
+                        )
 
                 tile_suffix = (
                     f"_tile_{tx + 1}_{ty + 1}"
@@ -1572,6 +1782,16 @@ def get_zipped_tiles(user_dict: dict[str, Any]):
     assert not (config.bottom_image != None and config.top_thickness != None), "Error: Can't use both bottom_image and top_thickness"
     assert not (config.bottom_elevation != None and config.no_bottom == True), "Error: Can't use no_bottom=True and also want a bottom_elevation (" + config.bottom_elevation + ")"
     assert not (config.bottom_elevation != None and config.top_thickness != None), "Error: Can't use both bottom_elevation and top_thickness"
+    assert not (
+        config.bottom_elevation is not None
+        and config.nudge_in_overused_edges_vertex
+        and not config.bottom_thru_base
+        and not config.interlocking_mesh_pair
+    ), (
+        "Error: nudge_in_overused_edges_vertex with bottom_elevation requires "
+        "interlocking_mesh_pair=True so positive-Z nudging can be shared "
+        "between the normal and difference meshes"
+    )
 
     assert not (config.bottom_elevation != None and config.use_geo_coords != None), "Error: use_geo_coords is currently not supported with a bottom_elevation raster"
 
