@@ -81,9 +81,13 @@ class RasterVariants:
     
     Raster values set to NaN and no polygon_intersection_geometry set if the cell quad is disjoint from the clipping polygon.
        
-    Raster value kept as imported and polygon_intersection_geometry if there is any intersection between cell and clipping polygon. We determine wall marking by comparing edge buckets + dilated elevation raster + L/PL (line / polygon line) between shared edges.
+    Raster value kept as imported for any non-disjoint cell. Partial cells
+    store polygon_intersection_geometry. Fully contained cells are tracked by
+    polygon_intersection_contains_properly and intentionally do not store
+    redundant full-cell intersection geometry.
     
-    Before create_cell() is called, we set the polygon_intersection_geometry to None for all cells that are contained properly in the clipping polygon so that create_cell() can reply solely on a RasterVariants for info and know to use the quad for enclosed cells so flipping may be applied.
+    Contained cells have polygon_intersection_geometry set to None so that
+    create_cell() uses the normal quad and split rotation for enclosed cells.
     """
     
     # ndarray dtype=object so we can set it with a dict[str, list[BorderEdge]].
@@ -93,7 +97,9 @@ class RasterVariants:
     
     This is not a variant!
     
-    polygon_intersection_edge_buckets existence is same as polygon_intersection_geometry to indicate disjoint or contained properly. 
+    Partial cells store edge buckets for clipped-boundary wall ownership.
+    Disjoint and contained cells do not store buckets; contained cells are
+    identified by polygon_intersection_contains_properly.
     
     TODO: This should be stored in the cell object but we only keep the cell objects as we iterate through them so RasterVariants is the place to store this to maintain state.
     """

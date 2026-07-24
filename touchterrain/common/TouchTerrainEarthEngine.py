@@ -1297,6 +1297,11 @@ def _get_interlocking_pair_zipped_tiles(
                 ),
                 elevation_raster=difference_top_variants.dilated,
                 direction=(-1, -1),
+                polygon_intersection_contains_properly=(
+                    difference_top_variants
+                    .polygon_intersection_contains_properly
+                ),
+                cell_size_mm=print3D_resolution_mm,
             )
 
         if config.clean_diags:
@@ -1345,6 +1350,11 @@ def _get_interlocking_pair_zipped_tiles(
                 ),
                 elevation_raster=normal_top_variants.dilated,
                 direction=(-1, -1),
+                polygon_intersection_contains_properly=(
+                    normal_top_variants
+                    .polygon_intersection_contains_properly
+                ),
+                cell_size_mm=print3D_resolution_mm,
             )
 
         min_bottom_elev = None
@@ -2732,7 +2742,18 @@ def get_zipped_tiles(user_dict: dict[str, Any]):
         if config.edge_clipping_polygon:
             #region Mark shared edges of the W and N neighbor of each cell for walls if needed
             print('Marking shared edges for walls')
-            mark_shared_edges_for_walls(polygon_intersection_edge_buckets=top_raster_variants.polygon_intersection_edge_buckets, elevation_raster=top_raster_variants.dilated, direction=(-1, -1))
+            mark_shared_edges_for_walls(
+                polygon_intersection_edge_buckets=(
+                    top_raster_variants.polygon_intersection_edge_buckets
+                ),
+                elevation_raster=top_raster_variants.dilated,
+                direction=(-1, -1),
+                polygon_intersection_contains_properly=(
+                    top_raster_variants
+                    .polygon_intersection_contains_properly
+                ),
+                cell_size_mm=print3D_resolution_mm,
+            )
             #endregion
             
             # Debug: plot all polygon_intersection_geometry(s)

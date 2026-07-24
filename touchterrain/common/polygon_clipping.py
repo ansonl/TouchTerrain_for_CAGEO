@@ -1,14 +1,15 @@
+from __future__ import annotations
+
 import functools
 import logging
-import multiprocessing
 import os
 import warnings
-from typing import TypeAlias
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, TypeAlias
 
-import geopandas
 import numpy
-import pyproj
 import shapely
+from shapely.prepared import prep
 from shapely.ops import unary_union
 
 # try to import gdal from multiple sources
@@ -22,11 +23,13 @@ from touchterrain.common.RasterVariants import RasterVariants
 from touchterrain.common.user_config import TouchTerrainConfig
 from touchterrain.common.utils import geoCoordToPrint2DCoord, arrayCellCoordToQuadPrint2DCoords
 from touchterrain.common.shapely_utils import flatten_geometries, flatten_geometries_borderEdge, sort_line_segment_based_contains
+from touchterrain.common.wall_visualization import BorderEdgePlotRecord
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 EdgeBuckets: TypeAlias = dict[str, list[BorderEdge]]
+PreparedClippingPolygon: TypeAlias = tuple[shapely.Polygon, Any]
 PolygonClipUpdates: TypeAlias = tuple[
     list[tuple[int, int]],
     list[tuple[int, int, list[shapely.Geometry]]],
@@ -34,14 +37,39 @@ PolygonClipUpdates: TypeAlias = tuple[
     list[tuple[int, int]],
 ]
 EDGE_BUCKET_KEYS = ("N", "W", "S", "E", "other")
+OPPOSITE_SIDE = {"N": "S", "S": "N", "W": "E", "E": "W"}
 
 
 def _empty_edge_buckets() -> EdgeBuckets:
     return {key: [] for key in EDGE_BUCKET_KEYS}
 
 
+def _polygon_clip_row_ranges(
+    row_count: int,
+    worker_count: int,
+) -> list[tuple[int, int]]:
+    """Split polygon clipping rows into deterministic worker chunks."""
+    if row_count <= 0:
+        return []
+
+    bounded_workers = max(1, min(worker_count, row_count))
+    base_rows_per_worker = row_count // bounded_workers
+    extra_rows = row_count % bounded_workers
+    row_ranges = []
+    start_row = 0
+    for worker_idx in range(bounded_workers):
+        rows_for_worker = (
+            base_rows_per_worker
+            + (1 if worker_idx < extra_rows else 0)
+        )
+        end_row = start_row + rows_for_worker
+        row_ranges.append((start_row, end_row))
+        start_row = end_row
+    return row_ranges
+
+
 def _log_info(msg: str) -> None:
-    """Send logging to configured handlers or stdout when none are present (spawned workers)."""
+    """Send logging to configured handlers or stdout when none are present."""
     if logger.hasHandlers():
         logger.info(msg)
     else:
@@ -71,7 +99,7 @@ def _union_clipping_polygons(
 
 
 def _geodataframe_has_finite_geometry(
-    polygon_boundary_gdf: geopandas.GeoDataFrame,
+    polygon_boundary_gdf: Any,
 ) -> bool:
     for geometry in polygon_boundary_gdf.geometry:
         if geometry is None or geometry.is_empty:
@@ -82,8 +110,10 @@ def _geodataframe_has_finite_geometry(
 
 
 def _nad83_projection_fallbacks(
-    target_crs: pyproj.CRS,
-) -> list[tuple[str, pyproj.CRS]]:
+    target_crs: Any,
+) -> list[tuple[str, Any]]:
+    import pyproj
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         proj4 = target_crs.to_proj4()
@@ -101,9 +131,11 @@ def _nad83_projection_fallbacks(
 
 
 def _project_polygon_boundary_gdf(
-    polygon_boundary_gdf: geopandas.GeoDataFrame,
+    polygon_boundary_gdf: Any,
     dem_projection: str,
-) -> geopandas.GeoDataFrame:
+) -> Any:
+    import pyproj
+
     projected_gdf = polygon_boundary_gdf.to_crs(dem_projection)
     if _geodataframe_has_finite_geometry(projected_gdf):
         return projected_gdf
@@ -123,7 +155,7 @@ def _project_polygon_boundary_gdf(
 def _process_polygon_clip_cell(
     i: int,
     j: int,
-    clipping_print2d_polys: list[shapely.Polygon],
+    clipping_print2d_polys: list[PreparedClippingPolygon],
     cell_size_mm: float,
     tile_y_shape: int,
 ) -> tuple[bool, list[shapely.Geometry], EdgeBuckets | None, bool]:
@@ -139,11 +171,11 @@ def _process_polygon_clip_cell(
     cell_polygon_intersection_edge_buckets: EdgeBuckets | None = None
     cell_contains_properly = False
 
-    for clippingPrint2DPoly in clipping_print2d_polys:
-        
+    for clippingPrint2DPoly, preparedClippingPrint2DPoly in clipping_print2d_polys:
         disjoint, intersection_geoms, intersection_edges, contains_properly = find_intersection_geometries(
             clippingPrint2DPoly=clippingPrint2DPoly,
             quadPrint2DCoords=quadPrint2DCoords,
+            preparedClippingPrint2DPoly=preparedClippingPrint2DPoly,
         )
         
         # Mark cell as not disjoint if needed
@@ -177,6 +209,10 @@ def _process_polygon_clip_rows(
     Worker can run this to process a chunk of rows. Returns lists of update info to apply in main process."""
     start_row, end_row = row_range
     _log_info(f"Polygon clipping starting rows [{start_row}, {end_row})")
+    prepared_clipping_print2d_polys = [
+        (clipping_poly, prep(clipping_poly))
+        for clipping_poly in clipping_print2d_polys
+    ]
     disjoint_cells = []
     polygon_intersection_geometry_updates = []
     polygon_intersection_edge_buckets_updates = []
@@ -187,7 +223,7 @@ def _process_polygon_clip_rows(
             cell_disjoint, cell_intersection_geoms, cell_edge_buckets, cell_contains_properly = _process_polygon_clip_cell(
                 i=i,
                 j=j,
-                clipping_print2d_polys=clipping_print2d_polys,
+                clipping_print2d_polys=prepared_clipping_print2d_polys,
                 cell_size_mm=cell_size_mm,
                 tile_y_shape=tile_y_shape,
             )
@@ -232,6 +268,7 @@ def _apply_polygon_clip_updates(
 def find_intersection_geometries(
     clippingPrint2DPoly: shapely.Polygon,
     quadPrint2DCoords: list[tuple[float, float]],
+    preparedClippingPrint2DPoly: Any | None = None,
 ) -> tuple[bool, list[shapely.Geometry] | None, EdgeBuckets | None, bool]:
     """Check if clipping polygon and cell polygon have no/partial/complete overlap. Return whether to set the cell to NaN, intersection polygons, intersection edges. 
     
@@ -245,17 +282,20 @@ def find_intersection_geometries(
     """
     # TODO: use shapely.box for optimization?
     quadPrint2DPoly = shapely.Polygon(quadPrint2DCoords)
+    clipping_predicates = (
+        preparedClippingPrint2DPoly
+        if preparedClippingPrint2DPoly is not None
+        else clippingPrint2DPoly
+    )
     
-    polygon_intersection_contains_properly = False
-    if clippingPrint2DPoly.contains_properly(quadPrint2DPoly): # quad is entirely inside polygon 
+    if clipping_predicates.contains_properly(quadPrint2DPoly): # quad is entirely inside polygon
         # We check if quad is entirely inside border poly with `contains_properly` instead using `contains` due to possible shared edges and points between quad and poly because a shared edge could have a neighboring cell with a partial intersection that does NOT contain the shared edge. i.e. There is a gap between the neighbor cell's intersection polygon and the shared edge. This neighboring cell will have a non-NaN value that does not work with our normal way of checking for wall existence on cells with full normal quads.
-        # leave the cell unchanged
-        polygon_intersection_contains_properly = True
+        return (False, None, None, True)
     
-    if clippingPrint2DPoly.disjoint(quadPrint2DPoly): # quad is entirely not in polygon
+    if clipping_predicates.disjoint(quadPrint2DPoly): # quad is entirely not in polygon
         # set the all variants to NaN in that location
         #surface_raster_variant.set_location_in_variants(location=(j,i), new_value=numpy.nan, set_edge_interpolation=False)
-        return (True, None, None, polygon_intersection_contains_properly) # the edge interpolation raster should not be changed and set to NaN
+        return (True, None, None, False) # the edge interpolation raster should not be changed and set to NaN
     else: # quad is partially inside poly or shares an edge/point
         intersection_geometry = clippingPrint2DPoly.intersection(quadPrint2DPoly)
         
@@ -288,13 +328,15 @@ def find_intersection_geometries(
                 print(f'Unknown bucket key {bucket_key}')
             intersection_edge_buckets[bucket_key[0]].append(be)
             
-        return (False, flat_intersection_geometries, intersection_edge_buckets, polygon_intersection_contains_properly)
+        return (False, flat_intersection_geometries, intersection_edge_buckets, False)
 
 def find_polygon_clipping_edges(config: TouchTerrainConfig, dem: gdal.Dataset, surface_raster_variant: list[RasterVariants], top_hint: numpy.ndarray|None, print3D_resolution_mm: float):
     """Find the intersection polygon between each raster cell and the clipping polygon. Sort all individual edges of intersection polygons into buckets stored in RasterVariants based on if the edge lies on a cardinal direction edge of the cell quad. Marks all interior edges as needing walls created. 
     
     Use the first RasterVariant in the list for calculations. Propagate any "set to NaN" changes to any other RasterVariants
     """
+    import geopandas
+
     if config.edge_clipping_polygon == None:
         print('find_polygon_clipping_edges: config.edge_fit_polygon_file not defined!')
         return
@@ -379,8 +421,8 @@ def find_polygon_clipping_edges(config: TouchTerrainConfig, dem: gdal.Dataset, s
     rows = surface_raster_variant[0].original.shape[0]
     cols = surface_raster_variant[0].original.shape[1]
 
-    # Decide whether to use multiprocessing for clipping
-    use_mp = config.CPU_cores_to_use not in (None, 1)
+    # Decide whether to use worker row chunks for clipping.
+    use_workers = config.CPU_cores_to_use not in (None, 1)
     worker_fn = functools.partial(
         _process_polygon_clip_rows,
         clipping_print2d_polys=clipping_print2d_polys,
@@ -389,36 +431,27 @@ def find_polygon_clipping_edges(config: TouchTerrainConfig, dem: gdal.Dataset, s
         grid_width=cols,
     )
 
-    if not use_mp:
+    if not use_workers:
         updates = worker_fn((0, rows))
         _apply_polygon_clip_updates(surface_raster_variant, top_hint, updates)
     else:
-        available_cores = os.cpu_count()-1 or 1
-        requested_cores = available_cores if config.CPU_cores_to_use == 0 else config.CPU_cores_to_use
+        available_cores = max(1, (os.cpu_count() or 1) - 1)
+        requested_cores = (
+            available_cores
+            if config.CPU_cores_to_use == 0
+            else config.CPU_cores_to_use
+        )
         worker_cores = max(1, min(requested_cores, rows))
         _log_info(f"Computing cell and clipping polygon with {worker_cores} workers")
+        row_ranges = _polygon_clip_row_ranges(rows, worker_cores)
 
-        base_rows_per_worker = rows // worker_cores
-        extra_rows = rows % worker_cores
-        row_ranges = []
-        start_row = 0
-        for worker_idx in range(worker_cores):
-            rows_for_worker = base_rows_per_worker + (1 if worker_idx < extra_rows else 0)
-            end_row = start_row + rows_for_worker
-            row_ranges.append((start_row, end_row))
-            start_row = end_row
-
-        mp = multiprocessing.get_context('spawn')
-        pool = mp.Pool(
-            processes=worker_cores,
-            maxtasksperchild=1,
-        )
-        try:
-            for updates in pool.imap_unordered(worker_fn, row_ranges):
-                _apply_polygon_clip_updates(surface_raster_variant, top_hint, updates)
-        finally:
-            pool.close()
-            pool.terminate()
+        with ThreadPoolExecutor(max_workers=worker_cores) as executor:
+            for updates in executor.map(worker_fn, row_ranges):
+                _apply_polygon_clip_updates(
+                    surface_raster_variant,
+                    top_hint,
+                    updates,
+                )
 
 def mark_overlapping_edges_for_walls(cell_1_edges: list[BorderEdge], cell_2_edges: list[BorderEdge]):
     """Mark overlapping edges between a cell and neighbor cell to make a wall. Sets the make_wall property of only the cell with the Polygon side of a match. 
@@ -505,115 +538,339 @@ def mark_overlapping_edges_for_walls(cell_1_edges: list[BorderEdge], cell_2_edge
             c2eIdx += 1
         c1eIdx += 1
 
-def mark_shared_edges_of_cell_for_walls(polygon_intersection_edge_buckets: numpy.ndarray, elevation_raster: numpy.ndarray, cell_location: tuple[int, int], direction: tuple[int, int]):
-    """Mark shared edges of a cell and the neighbor cell in the specified direction to have a wall if the edges overlap.
+def _cell_location_in_range(
+    location: tuple[int, int],
+    shape: tuple[int, int],
+) -> bool:
+    return 0 <= location[0] < shape[0] and 0 <= location[1] < shape[1]
 
-    :param polygon_intersection_edge_buckets: polygon_intersection_edge_buckets of type ndarray with dtype=object dict[str,list[BorderEdge]]. Should be the ndarray from RasterVariants.
-    :type polygon_intersection_edge_buckets: numpy.ndarray
-    :param elevation_raster: raster of type ndarray with dtype=float64. Should be an ndarray from RasterVariants that tells us if a cell has an elevation value set or not. We need this to differentiate between contained properly and disjoint cell because both cases have no polygon_intersection_edge_buckets set
-    :type elevation_raster: numpy.ndarray
-    :param cell_location: Target cell location in Y,X order
-    :type cell_location: tuple[int, int]
-    :param direction: Direction of neighboring cell in Y,X order
-    :type direction: tuple[int, int]
-    """
-    
-    cell_1_edge_buckets: dict[str, list[BorderEdge]] = polygon_intersection_edge_buckets[cell_location]
-    # Get 2 separate cell "2"s, one in vertical direction, one in horizontal direction
-    cell_2_location_y = cell_location[0]+direction[0]
-    cell_2_location_x = cell_location[1]+direction[1]
-    
-    cell_2_location_y_in_range = cell_2_location_y >= 0 and cell_2_location_y < polygon_intersection_edge_buckets.shape[0]
-    cell_2_location_x_in_range = cell_2_location_x >= 0 and cell_2_location_x < polygon_intersection_edge_buckets.shape[1]
-    
-    # check if cell 1 should be any mesh generated later by checking dilated elevation value for not-NaN
-    if not numpy.isnan(elevation_raster[cell_location]):
-        if not isinstance(cell_1_edge_buckets, dict): # non-NaN cells should be intersecting the clipping polygon (partially or enclosed) and have a edge bucket
-            raise ValueError("cell 1 elevation raster value is not NaN but has no edge bucket dict")
-        # If cell 1 has mesh generated, then check if cell 2 is in range and cell 2 will have mesh generated. 
-        if cell_2_location_y_in_range:
-            cell_2_location = (cell_2_location_y,cell_location[1])
-            cell_2_y_edge_buckets = polygon_intersection_edge_buckets[cell_2_location]
-            if not numpy.isnan(elevation_raster[cell_2_location]): # do overlapping edge check if cell 2 dilated elevation is not NaN (assume it has a edge bucket dict if not NaN)
-                # cell 2 should have mesh created later and has buckets to compare
-                if direction[0] == -1: #N
-                    mark_overlapping_edges_for_walls(cell_1_edges=cell_1_edge_buckets['N'], cell_2_edges=cell_2_y_edge_buckets['S'])
-                elif direction[0] == 1: #S
-                    mark_overlapping_edges_for_walls(cell_1_edges=cell_1_edge_buckets['S'], cell_2_edges=cell_2_y_edge_buckets['N'])
-                elif direction[0] != 0:
-                    print(f'mark_shared_edges_of_cell_for_walls: unsupported direction of {direction[0]}')
-            else: # cell 2 elevation_raster is NaN. Make walls on cell 1 shared side.
-                if direction[0] == -1: #N
-                    for e in cell_1_edge_buckets['N']:
-                        e.make_wall = True
-                if direction[0] == 1: #S
-                    for e in cell_1_edge_buckets['S']:
-                        e.make_wall = True  
-        else:
-            # Direction of cell 2 is out of range.
-            if direction[0] == -1: #N
-                for e in cell_1_edge_buckets['N']:
-                    e.make_wall = True
-            if direction[0] == 1: #S
-                for e in cell_1_edge_buckets['S']:
-                    e.make_wall = True
-        
-        if cell_2_location_x_in_range:
-            cell_2_location = (cell_location[0], cell_2_location_x)
-            cell_2_x_edge_buckets = polygon_intersection_edge_buckets[cell_2_location]
-            if not numpy.isnan(elevation_raster[cell_2_location]): # do overlapping edge check if cell 2 dilated elevation is not NaN (assume it has a edge bucket dict)
-                # cell 2 has buckets to compare
-                if direction[1] == -1: #W
-                    mark_overlapping_edges_for_walls(cell_1_edges=cell_1_edge_buckets['W'], cell_2_edges=cell_2_x_edge_buckets['E'])
-                elif direction[1] == 1: #E
-                    mark_overlapping_edges_for_walls(cell_1_edges=cell_1_edge_buckets['E'], cell_2_edges=cell_2_x_edge_buckets['W'])
-                elif direction[1] != 0:
-                    print(f'mark_shared_edges_of_cell_for_walls: unsupported direction of {direction[1]}')
-            else: # cell 2 elevation_raster is NaN. Make walls on cell 1 shared side.
-                if direction[1] == -1: #W
-                    for e in cell_1_edge_buckets['W']:
-                        e.make_wall = True
-                if direction[1] == 1: #E
-                    for e in cell_1_edge_buckets['E']:
-                        e.make_wall = True  
-        else:
-            # Direction of cell 2 is out of range.
-            if direction[1] == -1: #W
-                for e in cell_1_edge_buckets['W']:
-                    e.make_wall = True
-            if direction[1] == 1: #E
-                for e in cell_1_edge_buckets['E']:
-                    e.make_wall = True
-    else:
-        # This case happens when:
-        # If cell 1 elevation_raster is NaN:
-        # e.g. cell 1 is outside the polygon or cell 1 will not have mesh generated for it -> if cell 2 will have mesh generated -> cell 2 should make walls 
-        if numpy.isnan(elevation_raster[cell_location]):
-            if cell_2_location_y_in_range and not numpy.isnan(elevation_raster[cell_2_location_y,cell_location[1]]) and polygon_intersection_edge_buckets[cell_2_location_y,cell_location[1]]:
-                cell_2_y_edge_buckets = polygon_intersection_edge_buckets[cell_2_location_y,cell_location[1]]
-                if direction[0] == -1: #N
-                    for e in cell_2_y_edge_buckets['S']:
-                        e.make_wall = True
-                if direction[0] == 1: #S
-                    for e in cell_2_y_edge_buckets['N']:
-                        e.make_wall = True
-            if cell_2_location_x_in_range and not numpy.isnan(elevation_raster[cell_location[0],cell_2_location_x]) and polygon_intersection_edge_buckets[cell_location[0],cell_2_location_x]:
-                cell_2_x_edge_buckets = polygon_intersection_edge_buckets[cell_location[0],cell_2_location_x]
-                if direction[1] == -1: #W
-                    for e in cell_2_x_edge_buckets['E']:
-                        e.make_wall = True
-                if direction[1] == 1: #E
-                    for e in cell_2_x_edge_buckets['W']:
-                        e.make_wall = True
-        # If cell 1 elevation_raster is not NaN:
-        # e.g. cell 1 is contained properly in boundary -> no walls
-    
-    pass
 
-def mark_shared_edges_for_walls(polygon_intersection_edge_buckets: numpy.ndarray, elevation_raster: numpy.ndarray, direction: tuple[int, int]):
-    """Mark shared edges of all cells in an ndarray and the neighbor cell in the specified direction to have a wall if the edges overlap.
-    """
-    for j in range(0, polygon_intersection_edge_buckets.shape[0]): # Y
-        print(f"Starting row {j}/{polygon_intersection_edge_buckets.shape[0]}")
-        for i in range(0, polygon_intersection_edge_buckets.shape[1]): # X
-            mark_shared_edges_of_cell_for_walls(polygon_intersection_edge_buckets=polygon_intersection_edge_buckets, elevation_raster=elevation_raster, cell_location=(j,i), direction=direction)
+def _cell_has_mesh(
+    elevation_raster: numpy.ndarray,
+    location: tuple[int, int],
+) -> bool:
+    return not numpy.isnan(elevation_raster[location])
+
+
+def _cell_is_contained(
+    polygon_intersection_contains_properly: numpy.ndarray | None,
+    location: tuple[int, int],
+) -> bool:
+    return (
+        polygon_intersection_contains_properly is not None
+        and bool(polygon_intersection_contains_properly[location])
+    )
+
+
+def _cell_clip_state(
+    polygon_intersection_edge_buckets: numpy.ndarray,
+    polygon_intersection_contains_properly: numpy.ndarray | None,
+    elevation_raster: numpy.ndarray,
+    location: tuple[int, int],
+) -> str:
+    """Return outside, contained, or partial for one clipped cell."""
+    if not _cell_location_in_range(location, elevation_raster.shape):
+        return "outside"
+    if not _cell_has_mesh(elevation_raster, location):
+        return "outside"
+    if _cell_is_contained(polygon_intersection_contains_properly, location):
+        return "contained"
+    if isinstance(polygon_intersection_edge_buckets[location], dict):
+        return "partial"
+    raise ValueError(
+        "Clipped cell has mesh but is neither contained nor partial at "
+        f"row={location[0]}, col={location[1]}."
+    )
+
+
+def _quad_side_line(
+    cell_location: tuple[int, int],
+    side: str,
+    cell_size_mm: float,
+    tile_y_shape: int,
+) -> shapely.LineString:
+    quad_coords = arrayCellCoordToQuadPrint2DCoords(
+        array_coord_2D=(cell_location[1], cell_location[0]),
+        cell_size=cell_size_mm,
+        tile_y_shape=tile_y_shape,
+    )
+    side_coords = {
+        "N": (quad_coords[3], quad_coords[0]),
+        "W": (quad_coords[0], quad_coords[1]),
+        "S": (quad_coords[1], quad_coords[2]),
+        "E": (quad_coords[2], quad_coords[3]),
+    }
+    return shapely.LineString(side_coords[side])
+
+
+def _contained_side_edge(
+    cell_location: tuple[int, int],
+    side: str,
+    cell_size_mm: float,
+    tile_y_shape: int,
+    make_wall: bool = False,
+) -> BorderEdge:
+    return BorderEdge(
+        geometry=_quad_side_line(
+            cell_location,
+            side,
+            cell_size_mm,
+            tile_y_shape,
+        ),
+        polygon_line=True,
+        make_wall=make_wall,
+    )
+
+
+def _mark_all_edges_for_wall(edges: list[BorderEdge]) -> None:
+    for edge in edges:
+        edge.make_wall = True
+
+
+def _side_edges_for_wall_marking(
+    polygon_intersection_edge_buckets: numpy.ndarray,
+    location: tuple[int, int],
+    state: str,
+    side: str,
+    cell_size_mm: float,
+    tile_y_shape: int,
+) -> list[BorderEdge]:
+    if state == "partial":
+        return polygon_intersection_edge_buckets[location][side]
+    if state == "contained":
+        return [
+            _contained_side_edge(
+                location,
+                side,
+                cell_size_mm,
+                tile_y_shape,
+            )
+        ]
+    return []
+
+
+def _mark_shared_side_for_walls(
+    polygon_intersection_edge_buckets: numpy.ndarray,
+    polygon_intersection_contains_properly: numpy.ndarray | None,
+    elevation_raster: numpy.ndarray,
+    current_location: tuple[int, int],
+    neighbor_location: tuple[int, int],
+    current_side: str,
+    cell_size_mm: float,
+) -> None:
+    tile_y_shape = polygon_intersection_edge_buckets.shape[0]
+    current_state = _cell_clip_state(
+        polygon_intersection_edge_buckets,
+        polygon_intersection_contains_properly,
+        elevation_raster,
+        current_location,
+    )
+    neighbor_state = _cell_clip_state(
+        polygon_intersection_edge_buckets,
+        polygon_intersection_contains_properly,
+        elevation_raster,
+        neighbor_location,
+    )
+    neighbor_side = OPPOSITE_SIDE[current_side]
+
+    if current_state == "outside" and neighbor_state == "outside":
+        return
+    if current_state == "contained" and neighbor_state == "contained":
+        return
+
+    if current_state == "partial" and neighbor_state == "outside":
+        _mark_all_edges_for_wall(
+            polygon_intersection_edge_buckets[current_location][current_side]
+        )
+        return
+    if current_state == "outside" and neighbor_state == "partial":
+        _mark_all_edges_for_wall(
+            polygon_intersection_edge_buckets[neighbor_location][neighbor_side]
+        )
+        return
+
+    if "partial" not in (current_state, neighbor_state):
+        # Contained-vs-outside walls are ordinary cardinal raster borders.
+        return
+
+    current_edges = _side_edges_for_wall_marking(
+        polygon_intersection_edge_buckets,
+        current_location,
+        current_state,
+        current_side,
+        cell_size_mm,
+        tile_y_shape,
+    )
+    neighbor_edges = _side_edges_for_wall_marking(
+        polygon_intersection_edge_buckets,
+        neighbor_location,
+        neighbor_state,
+        neighbor_side,
+        cell_size_mm,
+        tile_y_shape,
+    )
+    mark_overlapping_edges_for_walls(
+        cell_1_edges=current_edges,
+        cell_2_edges=neighbor_edges,
+    )
+
+
+def mark_shared_edges_of_cell_for_walls(
+    polygon_intersection_edge_buckets: numpy.ndarray,
+    elevation_raster: numpy.ndarray,
+    cell_location: tuple[int, int],
+    direction: tuple[int, int],
+    *,
+    polygon_intersection_contains_properly: numpy.ndarray | None = None,
+    cell_size_mm: float | None = None,
+) -> None:
+    """Mark clipped shared side edges that need surface polygon walls."""
+    if cell_size_mm is None:
+        cell_size_mm = 1.0
+    if direction[0] != 0:
+        current_side = "N" if direction[0] == -1 else "S"
+        neighbor_location = (
+            cell_location[0] + direction[0],
+            cell_location[1],
+        )
+        _mark_shared_side_for_walls(
+            polygon_intersection_edge_buckets,
+            polygon_intersection_contains_properly,
+            elevation_raster,
+            cell_location,
+            neighbor_location,
+            current_side,
+            cell_size_mm,
+        )
+    if direction[1] != 0:
+        current_side = "W" if direction[1] == -1 else "E"
+        neighbor_location = (
+            cell_location[0],
+            cell_location[1] + direction[1],
+        )
+        _mark_shared_side_for_walls(
+            polygon_intersection_edge_buckets,
+            polygon_intersection_contains_properly,
+            elevation_raster,
+            cell_location,
+            neighbor_location,
+            current_side,
+            cell_size_mm,
+        )
+
+
+def mark_shared_edges_for_walls(
+    polygon_intersection_edge_buckets: numpy.ndarray,
+    elevation_raster: numpy.ndarray,
+    direction: tuple[int, int],
+    *,
+    polygon_intersection_contains_properly: numpy.ndarray | None = None,
+    cell_size_mm: float | None = None,
+) -> None:
+    """Mark clipped side edges that need surface polygon walls."""
+    if cell_size_mm is None:
+        cell_size_mm = 1.0
+    row_count = polygon_intersection_edge_buckets.shape[0]
+    progress_step = max(1, row_count // 10)
+    for j in range(row_count):
+        if j == 0 or j == row_count - 1 or j % progress_step == 0:
+            _log_info(
+                "Marking clipped shared edges for row "
+                f"{j}/{row_count}"
+            )
+        for i in range(polygon_intersection_edge_buckets.shape[1]):
+            mark_shared_edges_of_cell_for_walls(
+                polygon_intersection_edge_buckets=(
+                    polygon_intersection_edge_buckets
+                ),
+                elevation_raster=elevation_raster,
+                cell_location=(j, i),
+                direction=direction,
+                polygon_intersection_contains_properly=(
+                    polygon_intersection_contains_properly
+                ),
+                cell_size_mm=cell_size_mm,
+            )
+
+
+def clipping_wall_visualization_edge_records(
+    polygon_intersection_edge_buckets: numpy.ndarray,
+    elevation_raster: numpy.ndarray,
+    polygon_intersection_contains_properly: numpy.ndarray | None,
+    cell_size_mm: float,
+) -> list[list[BorderEdgePlotRecord]]:
+    """Return grouped debug plot records for clipped wall ownership."""
+    edge_groups: list[list[BorderEdgePlotRecord]] = []
+    tile_y_shape = polygon_intersection_edge_buckets.shape[0]
+
+    for location, buckets in numpy.ndenumerate(polygon_intersection_edge_buckets):
+        if isinstance(buckets, dict):
+            edge_groups.append(
+                [
+                    BorderEdgePlotRecord(edge=edge)
+                    for side in EDGE_BUCKET_KEYS
+                    for edge in buckets[side]
+                ]
+            )
+
+    cardinal_sides = {
+        "N": (-1, 0),
+        "W": (0, -1),
+        "S": (1, 0),
+        "E": (0, 1),
+    }
+    for location, _value in numpy.ndenumerate(elevation_raster):
+        if not _cell_is_contained(
+            polygon_intersection_contains_properly,
+            location,
+        ):
+            continue
+        for side, offset in cardinal_sides.items():
+            neighbor_location = (
+                location[0] + offset[0],
+                location[1] + offset[1],
+            )
+            if (
+                not _cell_location_in_range(
+                    neighbor_location,
+                    elevation_raster.shape,
+                )
+                or not _cell_has_mesh(elevation_raster, neighbor_location)
+            ):
+                edge_groups.append(
+                    [
+                        BorderEdgePlotRecord(
+                            edge=_contained_side_edge(
+                                location,
+                                side,
+                                cell_size_mm,
+                                tile_y_shape,
+                                make_wall=True,
+                            ),
+                            source="contained_cardinal_wall",
+                        )
+                    ]
+                )
+    return edge_groups
+
+
+def clipping_wall_visualization_edges(
+    polygon_intersection_edge_buckets: numpy.ndarray,
+    elevation_raster: numpy.ndarray,
+    polygon_intersection_contains_properly: numpy.ndarray | None,
+    cell_size_mm: float,
+) -> list[list[BorderEdge]]:
+    """Return grouped raw edges for debug plots of clipped wall ownership."""
+    return [
+        [record.edge for record in edge_group]
+        for edge_group in clipping_wall_visualization_edge_records(
+            polygon_intersection_edge_buckets=(
+                polygon_intersection_edge_buckets
+            ),
+            elevation_raster=elevation_raster,
+            polygon_intersection_contains_properly=(
+                polygon_intersection_contains_properly
+            ),
+            cell_size_mm=cell_size_mm,
+        )
+    ]
