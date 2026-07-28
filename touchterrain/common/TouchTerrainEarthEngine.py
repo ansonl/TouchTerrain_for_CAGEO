@@ -46,13 +46,15 @@ if DEV_MODE:
 
 import touchterrain.common
 from touchterrain.common.grid_tesselate import (
-    BottomSurfaceProvider,
     ProcessingTile,
     _build_positive_z_nudge_plan,
     _cleanup_cells_for_mesh_serialization,
     _filter_positive_z_nudge_plan_to_actual_overused_edges,
-    _single_job_parallel_workers,
     grid,
+)
+from touchterrain.common.mesh_vocabulary import (
+    BottomSurfaceProvider,
+    single_job_parallel_workers,
 )
 from touchterrain.common.user_config import TouchTerrainConfig
 from touchterrain.common.tile_info import TouchTerrainTileInfo
@@ -165,7 +167,7 @@ def _finalize_pair_buffers(
     config: TouchTerrainConfig,
 ) -> tuple[bytes | str, float, bytes | str, float]:
     """Finalize normal and difference buffers, parallel when it is safe."""
-    workers = _single_job_parallel_workers(config, task_count=2)
+    workers = single_job_parallel_workers(config, task_count=2)
     if workers <= 1:
         normal_buffer, normal_size = _finalize_deferred_grid_buffer(
             normal_grid,
@@ -1607,7 +1609,7 @@ def _get_interlocking_pair_zipped_tiles(
                         xmaxidx=normal_grid.xmaxidx,
                         zero_threshold=normal_tile_info.config.basethick,
                         output_fileformat=normal_tile_info.config.fileformat,
-                        parallel_workers=_single_job_parallel_workers(
+                        parallel_workers=single_job_parallel_workers(
                             normal_tile_info.config,
                             normal_grid.ymaxidx,
                         ),
@@ -1617,7 +1619,7 @@ def _get_interlocking_pair_zipped_tiles(
                         confirmation_cells,
                         normal_tile_info.config.fileformat,
                         normal_tile_info.config.split_rotation,
-                        _single_job_parallel_workers(
+                        single_job_parallel_workers(
                             normal_tile_info.config,
                             confirmation_cells.shape[0],
                         ),
@@ -1632,7 +1634,7 @@ def _get_interlocking_pair_zipped_tiles(
                             normal_grid.offsety,
                             normal_tile_info.config.split_rotation,
                             normal_tile_info.config.fileformat,
-                            parallel_workers=_single_job_parallel_workers(
+                            parallel_workers=single_job_parallel_workers(
                                 normal_tile_info.config,
                                 normal_grid.ymaxidx,
                             ),

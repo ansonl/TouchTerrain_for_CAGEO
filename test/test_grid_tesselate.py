@@ -27,7 +27,7 @@ from touchterrain.common.grid_tesselate import (
     _positive_z_effective_difference_corners,
     _surface_polygons_with_midpoint_z,
     _z0_adjusted_keep_surface_planes,
-    _single_job_parallel_workers,
+    single_job_parallel_workers,
     boundary_edge_map_from_meshes,
     cell,
     edge_3d_signature,
@@ -2937,10 +2937,21 @@ class TestPositiveZNudge(unittest.TestCase):
         self.assertEqual(east_split_vertices, {expected_split_vertex})
 
     def test_positive_z_has_no_cross_cell_split_cache(self):
-        source = Path(grid_tesselate.__file__).read_text()
+        # Scan the whole package so this stays correct as nudge code moves
+        # into modules that do not exist yet.
+        package_dir = Path(grid_tesselate.__file__).parent
 
-        self.assertNotIn("positive_z_split_linework_by_location", source)
-        self.assertNotIn("split_surface_boundaries_for_linework", source)
+        for module_path in sorted(package_dir.glob("*.py")):
+            source = module_path.read_text(encoding="utf-8")
+            with self.subTest(module=module_path.name):
+                self.assertNotIn(
+                    "positive_z_split_linework_by_location",
+                    source,
+                )
+                self.assertNotIn(
+                    "split_surface_boundaries_for_linework",
+                    source,
+                )
 
 
 class TestZ0NudgePrecision(unittest.TestCase):
@@ -3066,7 +3077,7 @@ class TestSingleJobParallelWorkers(unittest.TestCase):
     def test_obj_jobs_stay_serial(self):
         config = SimpleNamespace(fileformat="obj", CPU_cores_to_use=0)
 
-        self.assertEqual(_single_job_parallel_workers(config, 1000), 1)
+        self.assertEqual(single_job_parallel_workers(config, 1000), 1)
 
 
 class TestCornerInterpolation(unittest.TestCase):
