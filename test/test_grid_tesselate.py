@@ -6,6 +6,9 @@ import numpy as np
 import shapely
 
 import touchterrain.common.grid_tesselate as grid_tesselate
+from touchterrain.common.mesh_serialization import (
+    _line_serialized_xy_signature,
+)
 from touchterrain.common.nudge_corner import IntermediateCorner
 from touchterrain.common.Quad import quad
 from touchterrain.common.Vertex import vertex
@@ -14,7 +17,6 @@ from touchterrain.common.grid_tesselate import (
     _build_positive_z_nudge_plan,
     _canonicalize_clipped_triangles_by_serialized_xy,
     _filter_positive_z_nudge_plan_to_actual_overused_edges,
-    _line_serialized_xy_signature,
     _line_with_serialized_xy,
     _nudge_full_cell_footprint,
     _nudge_split_side_endpoint_edges,
