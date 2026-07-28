@@ -47,6 +47,48 @@ def _polygon_footprint_area(polygons):
 
 
 class TestWallMeshes(unittest.TestCase):
+    def test_adjacent_walls_convert_cell_without_copying_source_quads(self):
+        top = quad(
+            vertex(0, 1, 1),
+            vertex(0, 0, 2),
+            vertex(1, 0, 3),
+            vertex(1, 1, 4),
+        )
+        bottom = quad(
+            vertex(0, 1, 0),
+            vertex(1, 1, 0),
+            vertex(1, 0, 0),
+            vertex(0, 0, 0),
+        )
+        north_wall = quad(
+            bottom.vl[0],
+            top.vl[0],
+            top.vl[3],
+            bottom.vl[1],
+        )
+        west_wall = quad(
+            top.vl[1],
+            top.vl[0],
+            bottom.vl[0],
+            bottom.vl[3],
+        )
+        current_cell = cell(
+            top,
+            bottom,
+            {"N": north_wall, "W": west_wall},
+        )
+
+        self.assertTrue(current_cell.check_for_tri_cell())
+        current_cell.convert_to_tri_cell()
+
+        self.assertTrue(current_cell.is_tri_cell)
+        self.assertEqual(
+            [mesh_vertex.coords for mesh_vertex in current_cell.topquad.vl[:3]],
+            [top.vl[3].coords, top.vl[1].coords, top.vl[2].coords],
+        )
+        self.assertEqual(set(current_cell.borders), {"N"})
+        self.assertFalse(current_cell.check_for_tri_cell())
+
     def test_wall_with_no_duplicate_vertices_stays_quad(self):
         wall = make_wall_without_exact_duplicate_vertices(
             vertex(0, 0, 0),
@@ -460,7 +502,7 @@ class TestSerializedSurfaceCleanup(unittest.TestCase):
                 vertex(1.0, 1.0, 0.0),
                 vertex(0.0, 1.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.topSurfacePolygons = [
             shapely.Polygon(
@@ -491,7 +533,7 @@ class TestSerializedSurfaceCleanup(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
             ),
             None,
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.topSurfacePolygons = [
             shapely.Polygon(
@@ -520,7 +562,7 @@ class TestSerializedSurfaceCleanup(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
             ),
             None,
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.surfacePolygonBorders = [
             quad(
@@ -554,7 +596,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(e, s, bottom_z_by_corner[IntermediateCorner.SE]),
                 vertex(w, s, bottom_z_by_corner[IntermediateCorner.SW]),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
     def _wall_with_directed_positive_top_edge(self, start, end):
@@ -569,7 +611,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             None,
             None,
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.surfacePolygonBorders = [
             self._wall_with_directed_positive_top_edge(start, end)
@@ -697,7 +739,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             None,
             None,
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.topSurfacePolygons = [
             shapely.Polygon([end, a, (0.0, 1.0, 0.0), end]),
@@ -911,7 +953,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
                 vertex(0.0, 0.0, 0.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         cells = np.empty((1, 1), dtype=object)
         cells[0, 0] = current_cell
@@ -948,7 +990,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.9),
                 vertex(0.0, 0.0, 0.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         cells = np.empty((1, 1), dtype=object)
         cells[0, 0] = current_cell
@@ -985,7 +1027,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
                 vertex(0.0, 0.0, 0.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         cells = np.empty((1, 1), dtype=object)
         cells[0, 0] = current_cell
@@ -1024,7 +1066,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
                 vertex(0.0, 0.0, 0.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         cells[0, 1] = cell(
             quad(
@@ -1039,7 +1081,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(2.0, 0.0, 0.5),
                 vertex(1.0, 0.0, 1.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         cells[1, 0] = cell(
             quad(
@@ -1054,7 +1096,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, -1.0, 0.5),
                 vertex(0.0, -1.0, 0.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         filtered = _filter_positive_z_nudge_plan_to_actual_overused_edges(
@@ -1119,7 +1161,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
                 vertex(0.0, 0.0, 0.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         cells[0, 0].topSurfacePolygons = [
             shapely.Polygon(
@@ -1154,7 +1196,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, -1.0, 0.5),
                 vertex(0.0, -1.0, 0.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         cells[1, 0].topSurfacePolygons = [
             shapely.Polygon(
@@ -1220,7 +1262,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         provider_bottom = [
             shapely.Polygon(
@@ -1305,7 +1347,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             self._wv_difference_top_quad(),
             self._flat_bottom_quad(),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         provider_bottom = self._normal_top_as_bottom_quad()
 
@@ -1346,7 +1388,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             self._wv_difference_top_quad(),
             self._flat_bottom_quad(),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         provider_bottom = self._normal_top_as_bottom_quad()
 
@@ -1370,7 +1412,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             self._wv_difference_top_quad(),
             self._normal_top_as_bottom_quad(),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell._force_top_split_to_bottom_surface(
             self._normal_top_as_bottom_quad(),
@@ -1401,7 +1443,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             self._wv_gap_difference_top_quad(),
             self._wv_gap_normal_top_as_bottom_quad(),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         self.assertEqual(
             current_cell.topquad.get_split_edge_indices(split_rotation),
@@ -1443,7 +1485,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
                 vertex(0.0, 0.0, 1.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         self.assertEqual(
             current_cell.topquad.get_split_edge_indices(split_rotation),
@@ -1475,7 +1517,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             self._wv_difference_top_quad(),
             self._normal_top_as_bottom_quad(),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         self.assertNotEqual(
             current_cell.topquad.get_split_edge_indices(split_rotation),
@@ -1512,7 +1554,7 @@ class TestPositiveZNudge(unittest.TestCase):
         split_rotation = 2
         top_quad = self._wv_difference_top_quad()
         initial_bottom_quad = self._flat_bottom_quad()
-        borders = {direction: False for direction in ["N", "S", "E", "W"]}
+        borders = {}
         borders["N"] = make_wall_without_exact_duplicate_vertices(
             initial_bottom_quad.vl[0],
             top_quad.vl[0],
@@ -1531,9 +1573,9 @@ class TestPositiveZNudge(unittest.TestCase):
         self.assertIsNone(current_cell.topSurfacePolygons)
         self.assertIsNone(current_cell.bottomSurfacePolygons)
         self.assertIsInstance(current_cell.borders["N"], quad)
-        self.assertIs(current_cell.borders["S"], False)
-        self.assertIs(current_cell.borders["E"], False)
-        self.assertIs(current_cell.borders["W"], False)
+        self.assertNotIn("S", current_cell.borders)
+        self.assertNotIn("E", current_cell.borders)
+        self.assertNotIn("W", current_cell.borders)
 
     def test_positive_difference_nudge_removes_contact_footprint(self):
         current_cell = cell(
@@ -1549,7 +1591,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 1.0),
                 vertex(0.0, 0.0, 1.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         changed = current_cell.apply_positive_z_difference_nudge(
@@ -1598,7 +1640,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 4.0),
                 vertex(0.0, 0.0, 2.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -1667,7 +1709,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 1.0, 2.5),
                 None,
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -1720,7 +1762,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 2.5),
                 vertex(0.0, 0.0, 2.5),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.bottomSurfacePolygons = [
             shapely.Polygon(
@@ -1870,7 +1912,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(e, s, bottom_z[IntermediateCorner.SE]),
                 vertex(w, s, bottom_z[IntermediateCorner.SW]),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -1992,7 +2034,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -2045,7 +2087,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -2093,7 +2135,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         normal_grid = object.__new__(grid_tesselate.grid)
         normal_grid.cells = np.array([[current_cell]], dtype=object)
@@ -2153,7 +2195,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -2225,7 +2267,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         difference_cell = cell(
             quad(
@@ -2240,7 +2282,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 1.0, 6.0),
                 None,
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -2313,7 +2355,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -2375,7 +2417,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(E, S, 0.905),
                 vertex(W, S, 1.125),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -2460,7 +2502,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.topSurfacePolygons = self._flat_surface_polygons(
             clipped_coords,
@@ -2530,7 +2572,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         clipped_coords = [
             (0.25, 0.0),
@@ -2561,7 +2603,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(2.0, 0.0, 0.0),
                 vertex(1.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
 
         self.assertTrue(
@@ -2628,7 +2670,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(4.9, 1.6, 1.679),
                 None,
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         before_area = shapely.Polygon(
             [(4.9, 1.7), (4.9, 1.6), (5.0, 1.6)],
@@ -2731,7 +2773,7 @@ class TestPositiveZNudge(unittest.TestCase):
         current_cell = cell(
             None,
             None,
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.topSurfacePolygons = [
             shapely.Polygon(
@@ -2783,7 +2825,7 @@ class TestPositiveZNudge(unittest.TestCase):
                 vertex(1.0, 0.0, 0.0),
                 vertex(0.0, 0.0, 0.0),
             ),
-            {direction: False for direction in ["N", "S", "E", "W"]},
+            {},
         )
         current_cell.topSurfacePolygons = [
             shapely.Polygon([c, d_top, a, c]),
@@ -3025,6 +3067,52 @@ class TestSingleJobParallelWorkers(unittest.TestCase):
         config = SimpleNamespace(fileformat="obj", CPU_cores_to_use=0)
 
         self.assertEqual(_single_job_parallel_workers(config, 1000), 1)
+
+
+class TestCornerInterpolation(unittest.TestCase):
+    def test_corner_grid_matches_canonical_scalar_interpolation(self):
+        raster = np.array(
+            [
+                [1.0, np.nan, 3.0, 4.0],
+                [5.0, 6.0, np.nan, 8.0],
+                [9.0, 10.0, 11.0, np.nan],
+                [np.nan, 14.0, 15.0, 16.0],
+            ],
+            dtype=np.float64,
+        )
+        expected = np.empty((3, 3), dtype=np.float64)
+        for row in range(expected.shape[0]):
+            for col in range(expected.shape[1]):
+                expected[row, col] = (
+                    grid_tesselate.interpolate_corner_with_canonical_order(
+                        raster,
+                        row,
+                        col,
+                    )
+                )
+
+        actual = grid_tesselate._interpolated_corner_grid(raster)
+
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_cell_corners_reference_shared_corner_grid(self):
+        corner_grid = np.arange(20, dtype=np.float64).reshape(4, 5)
+
+        elevations = grid_tesselate._cell_corner_elevations(
+            corner_grid,
+            i=2,
+            j=2,
+        )
+
+        self.assertEqual(
+            elevations,
+            (
+                corner_grid[1, 2],
+                corner_grid[1, 1],
+                corner_grid[2, 2],
+                corner_grid[2, 1],
+            ),
+        )
 
 
 class TestSerializationNormalization(unittest.TestCase):
