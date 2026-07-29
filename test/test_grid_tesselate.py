@@ -18,13 +18,13 @@ from touchterrain.common.grid_tesselate import (
     _canonicalize_clipped_triangles_by_serialized_xy,
     _filter_positive_z_nudge_plan_to_actual_overused_edges,
     _line_with_serialized_xy,
-    _nudge_full_cell_footprint,
+    full_cell_footprint,
     _nudge_split_side_endpoint_edges,
     _nudge_split_side_endpoint_xy,
     _positive_z_difference_neighbor_split_sides,
     _rebuild_matching_surface_polygon_borders,
     _triangulate_2d_geometry_to_3d_polygons,
-    _nudge_keep_footprint,
+    nudge_keep_footprint,
     _positive_z_nudge_corners_from_values,
     _positive_z_effective_difference_corners,
     _surface_polygons_with_midpoint_z,
@@ -1609,7 +1609,7 @@ class TestPositiveZNudge(unittest.TestCase):
         self.assertTrue(changed)
         self.assertAlmostEqual(
             _polygon_footprint_area(current_cell.topSurfacePolygons),
-            _nudge_full_cell_footprint(0.0, 1.0, 1.0, 0.0).area / 2,
+            full_cell_footprint(0.0, 1.0, 1.0, 0.0).area / 2,
         )
         cut_footprint = edge_xy_signature(
             (0.0, 0.5, 0.0),
@@ -1929,7 +1929,7 @@ class TestPositiveZNudge(unittest.TestCase):
             )
         )
 
-        expected_footprint = _nudge_keep_footprint(
+        expected_footprint = nudge_keep_footprint(
             affected_corners,
             w,
             e,
@@ -2212,7 +2212,7 @@ class TestPositiveZNudge(unittest.TestCase):
             )
         )
 
-        full_footprint = _nudge_full_cell_footprint(0.0, 1.0, 1.0, 0.0)
+        full_footprint = full_cell_footprint(0.0, 1.0, 1.0, 0.0)
         self.assertAlmostEqual(
             _polygon_footprint_area(current_cell.topSurfacePolygons),
             full_footprint.area,
@@ -2311,7 +2311,7 @@ class TestPositiveZNudge(unittest.TestCase):
             )
         )
 
-        full_footprint = _nudge_full_cell_footprint(0.0, 1.0, 1.0, 0.0)
+        full_footprint = full_cell_footprint(0.0, 1.0, 1.0, 0.0)
         self.assertAlmostEqual(
             _polygon_footprint_area(normal_cell.topSurfacePolygons),
             full_footprint.area,
@@ -2376,7 +2376,7 @@ class TestPositiveZNudge(unittest.TestCase):
             )
         )
 
-        full_footprint = _nudge_full_cell_footprint(0.0, 1.0, 1.0, 0.0)
+        full_footprint = full_cell_footprint(0.0, 1.0, 1.0, 0.0)
         self.assertAlmostEqual(
             _polygon_footprint_area(current_cell.topSurfacePolygons),
             full_footprint.area,
@@ -2968,7 +2968,7 @@ class TestZ0NudgePrecision(unittest.TestCase):
         }
         affected_corners = [IntermediateCorner.SE]
 
-        keep_footprint = _nudge_keep_footprint(
+        keep_footprint = nudge_keep_footprint(
             affected_corners,
             w,
             e,
