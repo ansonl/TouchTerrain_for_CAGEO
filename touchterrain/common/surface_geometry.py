@@ -10,11 +10,8 @@ plans, or rasters, so both ordinary cell creation and the nudge repair passes
 can use them.
 """
 
-import itertools
+from collections.abc import Callable, Collection, Sequence
 
-from collections.abc import Callable, Collection, Iterable, Sequence
-
-import numpy as np
 import shapely
 
 from touchterrain.common.Quad import quad
@@ -26,25 +23,18 @@ from touchterrain.common.mesh_vocabulary import (
     CARDINAL_DIRECTIONS,
     CardinalWallMap,
     CellBottomGeometry,
-    Coordinate,
     Edge3D,
     SerializedVertexCache,
-    SurfaceMesh,
     XYEdge,
     _empty_borders,
 )
 from touchterrain.common.mesh_serialization import (
     _canonicalize_clipped_triangles_by_serialized_xy,
-    _line_serialized_xy_signature,
-    _line_with_serialized_xy,
-    _boundary_line_map_by_serialized_xy,
     boundary_edge_map_from_meshes,
     edge_xy_signature,
     normalize_coordinate_to_match_mesh_serialization,
     normalize_vertex_to_match_mesh_serialization,
     polygon_normalized_to_match_mesh_serialization,
-    surface_polygon_normalized_to_match_mesh_serialization,
-    triangle_collapses_after_mesh_serialization,
     triangle_xy_collapses_after_mesh_serialization,
 )
 

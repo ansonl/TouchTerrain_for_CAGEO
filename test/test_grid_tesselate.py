@@ -6,39 +6,47 @@ import numpy as np
 import shapely
 
 import touchterrain.common.grid_tesselate as grid_tesselate
+import touchterrain.common.mesh_serialization as mesh_serialization
+import touchterrain.common.raster_interpolation as raster_interpolation
 from touchterrain.common.mesh_serialization import (
+    _boundary_line_map_by_serialized_xy,
+    _canonicalize_clipped_triangles_by_serialized_xy,
     _line_serialized_xy_signature,
+    _line_with_serialized_xy,
+    boundary_edge_map_from_meshes,
+    directed_edges_are_balanced,
+    edge_3d_signature,
+    edge_xy_signature,
+    normalize_vertex_to_match_mesh_serialization,
+    surface_mesh_edge_counts,
+    surface_mesh_edge_usage,
 )
+from touchterrain.common.RasterVariants import RasterVariants
+from touchterrain.common.interpolate_Z import interpolate_z_planar
 from touchterrain.common.nudge_corner import IntermediateCorner
 from touchterrain.common.Quad import quad
 from touchterrain.common.Vertex import vertex
 from touchterrain.common.grid_tesselate import (
-    _boundary_line_map_by_serialized_xy,
     _build_positive_z_nudge_plan,
-    _canonicalize_clipped_triangles_by_serialized_xy,
     _filter_positive_z_nudge_plan_to_actual_overused_edges,
-    _line_with_serialized_xy,
-    full_cell_footprint,
+    _positive_z_difference_neighbor_split_sides,
+    _positive_z_effective_difference_corners,
+    _positive_z_nudge_corners_from_values,
+    cell,
+)
+from touchterrain.common.mesh_vocabulary import single_job_parallel_workers
+from touchterrain.common.nudge_geometry import (
     _nudge_split_side_endpoint_edges,
     _nudge_split_side_endpoint_xy,
-    _positive_z_difference_neighbor_split_sides,
-    _rebuild_matching_surface_polygon_borders,
-    _triangulate_2d_geometry_to_3d_polygons,
-    nudge_keep_footprint,
-    _positive_z_nudge_corners_from_values,
-    _positive_z_effective_difference_corners,
     _surface_polygons_with_midpoint_z,
     _z0_adjusted_keep_surface_planes,
-    single_job_parallel_workers,
-    boundary_edge_map_from_meshes,
-    cell,
-    edge_3d_signature,
-    edge_xy_signature,
+    full_cell_footprint,
+    nudge_keep_footprint,
+)
+from touchterrain.common.surface_geometry import (
+    _rebuild_matching_surface_polygon_borders,
+    _triangulate_2d_geometry_to_3d_polygons,
     make_wall_without_exact_duplicate_vertices,
-    normalize_vertex_to_match_mesh_serialization,
-    directed_edges_are_balanced,
-    surface_mesh_edge_counts,
-    surface_mesh_edge_usage,
 )
 
 
@@ -279,11 +287,11 @@ class TestSerializedSurfaceCleanup(unittest.TestCase):
 
         z_by_xy = {}
         for triangle in triangles:
-            triangle_3d = grid_tesselate.interpolate_z_planar(
+            triangle_3d = interpolate_z_planar(
                 shapely.orient_polygons(triangle, exterior_cw=False),
                 [steep_plane],
             )
-            normalized = grid_tesselate.polygon_normalized_to_match_mesh_serialization(
+            normalized = mesh_serialization.polygon_normalized_to_match_mesh_serialization(
                 triangle_3d,
                 "STLb",
             )
@@ -1540,7 +1548,7 @@ class TestPositiveZNudge(unittest.TestCase):
         source_quad.forced_split_edge = (0, 2)
 
         normalized_quad = (
-            grid_tesselate.quad_normalized_to_match_mesh_serialization(
+            mesh_serialization.quad_normalized_to_match_mesh_serialization(
                 source_quad,
                 "STLb",
                 split_rotation,
@@ -3046,13 +3054,13 @@ class TestGridVertexIndexState(unittest.TestCase):
         bottom = np.zeros((3, 3), dtype=float)
         tile = grid_tesselate.ProcessingTile(
             tile_info,
-            grid_tesselate.RasterVariants(
+            RasterVariants(
                 top.copy(),
                 top.copy(),
                 top.copy(),
                 None,
             ),
-            grid_tesselate.RasterVariants(
+            RasterVariants(
                 bottom.copy(),
                 bottom.copy(),
                 bottom.copy(),
@@ -3097,21 +3105,21 @@ class TestCornerInterpolation(unittest.TestCase):
         for row in range(expected.shape[0]):
             for col in range(expected.shape[1]):
                 expected[row, col] = (
-                    grid_tesselate.interpolate_corner_with_canonical_order(
+                    raster_interpolation.interpolate_corner_with_canonical_order(
                         raster,
                         row,
                         col,
                     )
                 )
 
-        actual = grid_tesselate._interpolated_corner_grid(raster)
+        actual = raster_interpolation._interpolated_corner_grid(raster)
 
         np.testing.assert_array_equal(actual, expected)
 
     def test_cell_corners_reference_shared_corner_grid(self):
         corner_grid = np.arange(20, dtype=np.float64).reshape(4, 5)
 
-        elevations = grid_tesselate._cell_corner_elevations(
+        elevations = raster_interpolation._cell_corner_elevations(
             corner_grid,
             i=2,
             j=2,

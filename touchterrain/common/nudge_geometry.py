@@ -19,12 +19,9 @@ import shapely
 
 from touchterrain.common.Quad import quad
 from touchterrain.common.Vertex import vertex
-from touchterrain.common.interpolate_Z import interpolate_z_planar
 from touchterrain.common.nudge_corner import IntermediateCorner
 from touchterrain.common.mesh_vocabulary import (
     CARDINAL_DIRECTIONS,
-    CardinalWallMap,
-    Coordinate,
     NUDGE_MIDPOINT_CORNERS_BY_NAME,
     NUDGE_SIDE_ENDPOINT_NAMES,
     NUDGE_SIDE_MIDPOINT_NAME,
@@ -42,7 +39,6 @@ from touchterrain.common.surface_geometry import (
     _linework_covers_footprint,
     _rebuild_matching_surface_polygon_borders,
     _surface_wall_requested_lines,
-    _triangulate_2d_geometry_to_3d_polygons,
 )
 
 

@@ -15,9 +15,8 @@ normalize negative zero to positive zero.
 
 import struct
 
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
-import numpy as np
 import shapely
 
 from touchterrain.common.Quad import quad
