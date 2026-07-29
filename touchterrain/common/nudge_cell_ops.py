@@ -64,7 +64,7 @@ from touchterrain.common.nudge_geometry import (
 )
 
 if TYPE_CHECKING:
-    from touchterrain.common.grid_tesselate import cell
+    from touchterrain.common.Cell import cell
 
 
 def split_surface_boundary_midpoints(

@@ -32,8 +32,8 @@ from touchterrain.common.grid_tesselate import (
     _positive_z_difference_neighbor_split_sides,
     _positive_z_effective_difference_corners,
     _positive_z_nudge_corners_from_values,
-    cell,
 )
+from touchterrain.common.Cell import cell
 from touchterrain.common.mesh_vocabulary import single_job_parallel_workers
 from touchterrain.common.nudge_geometry import (
     _nudge_split_side_endpoint_edges,
