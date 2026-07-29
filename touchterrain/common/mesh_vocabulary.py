@@ -11,9 +11,9 @@ each other just to name a coordinate or a cell side.
 
 import os
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypeAlias, Union
+from typing import Any, Callable, TypeAlias, Union
 
 import shapely
 

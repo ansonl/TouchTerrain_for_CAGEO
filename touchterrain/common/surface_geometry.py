@@ -10,7 +10,8 @@ plans, or rasters, so both ordinary cell creation and the nudge repair passes
 can use them.
 """
 
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Collection, Sequence
+from typing import Callable
 
 import shapely
 

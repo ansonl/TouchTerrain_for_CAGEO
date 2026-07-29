@@ -47,10 +47,12 @@ if DEV_MODE:
 import touchterrain.common
 from touchterrain.common.grid_tesselate import (
     ProcessingTile,
-    _build_positive_z_nudge_plan,
     _cleanup_cells_for_mesh_serialization,
-    _filter_positive_z_nudge_plan_to_actual_overused_edges,
     grid,
+)
+from touchterrain.common.nudge_plan import (
+    build_positive_z_nudge_plan,
+    filter_positive_z_nudge_plan_to_actual_overused_edges,
 )
 from touchterrain.common.mesh_vocabulary import (
     BottomSurfaceProvider,
@@ -1594,7 +1596,7 @@ def _get_interlocking_pair_zipped_tiles(
                         if tile_difference_top.edge_interpolation is not None
                         else tile_difference_top.dilated
                     )
-                    candidate_positive_z_plan = _build_positive_z_nudge_plan(
+                    candidate_positive_z_plan = build_positive_z_nudge_plan(
                         upper_raster=positive_contact_top_raster,
                         lower_raster=lower_positive_raster,
                         emit_raster=difference_emit_raster,
@@ -1626,7 +1628,7 @@ def _get_interlocking_pair_zipped_tiles(
                     )
 
                     positive_z_nudge_plan = (
-                        _filter_positive_z_nudge_plan_to_actual_overused_edges(
+                        filter_positive_z_nudge_plan_to_actual_overused_edges(
                             candidate_positive_z_plan,
                             confirmation_cells,
                             normal_grid.cell_size,

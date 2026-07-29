@@ -26,15 +26,16 @@ from touchterrain.common.interpolate_Z import interpolate_z_planar
 from touchterrain.common.nudge_corner import IntermediateCorner
 from touchterrain.common.Quad import quad
 from touchterrain.common.Vertex import vertex
-from touchterrain.common.grid_tesselate import (
-    _build_positive_z_nudge_plan,
-    _filter_positive_z_nudge_plan_to_actual_overused_edges,
+from touchterrain.common.grid_tesselate import grid
+from touchterrain.common.Cell import cell
+from touchterrain.common.mesh_vocabulary import single_job_parallel_workers
+from touchterrain.common.nudge_plan import (
     _positive_z_difference_neighbor_split_sides,
     _positive_z_effective_difference_corners,
     _positive_z_nudge_corners_from_values,
+    build_positive_z_nudge_plan,
+    filter_positive_z_nudge_plan_to_actual_overused_edges,
 )
-from touchterrain.common.Cell import cell
-from touchterrain.common.mesh_vocabulary import single_job_parallel_workers
 from touchterrain.common.nudge_geometry import (
     _nudge_split_side_endpoint_edges,
     _nudge_split_side_endpoint_xy,
@@ -928,7 +929,7 @@ class TestPositiveZNudge(unittest.TestCase):
         lower[0:3, 1:3] = 2.0
         emit = upper.copy()
 
-        plan = _build_positive_z_nudge_plan(
+        plan = build_positive_z_nudge_plan(
             upper,
             lower,
             emit,
@@ -968,7 +969,7 @@ class TestPositiveZNudge(unittest.TestCase):
         cells = np.empty((1, 1), dtype=object)
         cells[0, 0] = current_cell
 
-        filtered = _filter_positive_z_nudge_plan_to_actual_overused_edges(
+        filtered = filter_positive_z_nudge_plan_to_actual_overused_edges(
             {
                 (1, 1): {
                     "corners": [],
@@ -1005,7 +1006,7 @@ class TestPositiveZNudge(unittest.TestCase):
         cells = np.empty((1, 1), dtype=object)
         cells[0, 0] = current_cell
 
-        filtered = _filter_positive_z_nudge_plan_to_actual_overused_edges(
+        filtered = filter_positive_z_nudge_plan_to_actual_overused_edges(
             {
                 (1, 1): {
                     "corners": [],
@@ -1042,7 +1043,7 @@ class TestPositiveZNudge(unittest.TestCase):
         cells = np.empty((1, 1), dtype=object)
         cells[0, 0] = current_cell
 
-        filtered = _filter_positive_z_nudge_plan_to_actual_overused_edges(
+        filtered = filter_positive_z_nudge_plan_to_actual_overused_edges(
             {
                 (1, 1): {
                     "corners": [IntermediateCorner.SE],
@@ -1109,7 +1110,7 @@ class TestPositiveZNudge(unittest.TestCase):
             {},
         )
 
-        filtered = _filter_positive_z_nudge_plan_to_actual_overused_edges(
+        filtered = filter_positive_z_nudge_plan_to_actual_overused_edges(
             {
                 (1, 1): {
                     "corners": [
@@ -1229,7 +1230,7 @@ class TestPositiveZNudge(unittest.TestCase):
             )
         ]
 
-        filtered = _filter_positive_z_nudge_plan_to_actual_overused_edges(
+        filtered = filter_positive_z_nudge_plan_to_actual_overused_edges(
             {},
             cells,
             cell_size=1.0,
