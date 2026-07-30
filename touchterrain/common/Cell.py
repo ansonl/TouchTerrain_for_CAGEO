@@ -13,7 +13,7 @@ nudge operations that rewrite a cell are therefore free functions in
 ``nudge_cell_ops``, reached here through thin delegating methods.
 """
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from typing import Union
 
 import shapely
@@ -24,7 +24,6 @@ from touchterrain.common.Vertex import vertex
 from touchterrain.common.interpolate_Z import interpolate_z_planar
 from touchterrain.common.nudge_corner import IntermediateCorner
 from touchterrain.common.shapely_polygon_utils import (
-    polygon_to_list_of_vertex,
     polygons_equal_3d,
 )
 from touchterrain.common.mesh_vocabulary import (
@@ -40,21 +39,16 @@ from touchterrain.common.mesh_vocabulary import (
 )
 from touchterrain.common.mesh_serialization import (
     _serialized_vertex_from_cache,
-    edge_3d_signature,
     normalize_coordinate_to_match_mesh_serialization,
-    normalize_vertex_to_match_mesh_serialization,
     polygon_normalized_to_match_mesh_serialization,
     quad_normalized_to_match_mesh_serialization,
     surface_polygon_normalized_to_match_mesh_serialization,
-    triangle_collapses_after_mesh_serialization,
 )
 from touchterrain.common.surface_geometry import (
     _build_cardinal_wall_borders,
-    _iter_polygon_parts,
     _linework_covers_footprint,
     _rebuild_matching_surface_polygon_borders,
     _surface_wall_requested_lines,
-    make_wall_without_exact_duplicate_vertices,
 )
 
 

@@ -47,7 +47,7 @@ if DEV_MODE:
 import touchterrain.common
 from touchterrain.common.grid_tesselate import (
     ProcessingTile,
-    _cleanup_cells_for_mesh_serialization,
+    cleanup_cells_for_mesh_serialization,
     grid,
 )
 from touchterrain.common.nudge_plan import (
@@ -1617,7 +1617,7 @@ def _get_interlocking_pair_zipped_tiles(
                         ),
                     )
                     confirmation_cells = copy.deepcopy(difference_grid.cells)
-                    _cleanup_cells_for_mesh_serialization(
+                    cleanup_cells_for_mesh_serialization(
                         confirmation_cells,
                         normal_tile_info.config.fileformat,
                         normal_tile_info.config.split_rotation,

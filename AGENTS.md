@@ -44,6 +44,32 @@ Cell creation logic order:
 
 - Other processing steps for other userconfigs not mentioned should be left in place.
 
+## Mesh module layout
+
+Mesh code in `touchterrain/common` is layered. A module may import only from
+layers below it. `grid_tesselate.py` does not postpone annotation evaluation,
+so an import that points upward is an import error, not a warning.
+
+| Layer | Module | Holds |
+| --- | --- | --- |
+| 1 | `mesh_vocabulary.py` | type aliases, cardinal and nudge corner tables, row-chunking helpers |
+| 2 | `mesh_serialization.py`, `raster_interpolation.py` | serialized-coordinate identity; canonical corner elevation |
+| 3 | `surface_geometry.py` | 2D footprint to 3D surface triangles, surface clipping, wall rebuilds |
+| 4 | `nudge_geometry.py` | keep footprints and inserted midpoints, shared by both nudge modes |
+| 5 | `nudge_cell_ops.py` | the four per-cell nudge repairs |
+| 6 | `Cell.py` | `class cell`: one cell's surfaces and walls |
+| 7 | `nudge_plan.py` | positive-Z candidates, then confirmation against emitted geometry |
+| 8 | `nudge_apply.py` | driving nudge repair over a grid, and the cell-creation seam |
+| 9 | `grid_tesselate.py` | `class grid`, cell creation, mesh writers |
+
+Nudging sits above `Cell` because confirming a positive-Z contact builds a
+throwaway cell and runs zero-height cleanup on it. The nudge operations are
+therefore free functions taking the cell or grid as an argument; `cell` and
+`grid` keep thin delegating methods so call sites and tests are unaffected.
+
+`create_cells` calls nudging rather than inlining it. Keep it that way: the
+generation path should stay readable without reading the nudge algorithm.
+
 ## Change guidance
 
 - Reuse or adapt existing classes and functions if the changed logic is relevant.
@@ -61,7 +87,9 @@ Cell creation logic order:
 ## Mesh validation after code changes
 
 - Follow `spec/mesh_validation.md` after code changes that affect emitted mesh topology, nudge behavior, clipping, bottom surfaces, or mesh serialization.
-- Default validation command: `conda run -n touchterrain-dev python tools\validate_launch_topology.py --mode nudge --mesh-workers 0 --mesh-timeout-seconds 900`
+- Default validation command: `conda run -n touchterrain-dev python tools\validate_launch_topology.py --mode all --mesh-workers 0 --mesh-timeout-seconds 900`
+- Use `--mode all` rather than `--mode nudge` for changes to shared mesh code. `--mode nudge` only runs the 22 configs whose name ends in `-nudge`, so it does not exercise the ordinary generation, clipping, and bottom-surface paths that the other configs cover.
+- 15 of the 48 configs currently report topology errors, all of them with nudging off. That is the existing state, not a regression; compare against it rather than expecting zero failures.
 - If only validation code changed, rerun validation with `--reuse-dir` pointed at a prior topology validation output folder instead of regenerating meshes.
 - Do not treat mesh topology errors as expected unless the option combination is documented in `spec/mesh_validation.md`.
 

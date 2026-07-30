@@ -23,8 +23,6 @@ meshes of an interlocking pair consume identical decisions while still building
 their geometry locally.
 """
 
-import copy
-
 from collections.abc import Iterable, Sequence
 from typing import Any, Callable
 
@@ -58,7 +56,6 @@ from touchterrain.common.mesh_vocabulary import (
 )
 from touchterrain.common.mesh_serialization import (
     _serialized_vertex_from_cache,
-    edge_3d_signature,
     edge_xy_signature,
     normalize_coordinate_to_match_mesh_serialization,
     normalize_vertex_to_match_mesh_serialization,

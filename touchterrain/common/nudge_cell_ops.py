@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 
 import shapely
 
-from touchterrain.common.Quad import quad
 from touchterrain.common.Vertex import vertex
 from touchterrain.common.nudge_corner import IntermediateCorner
 from touchterrain.common.mesh_vocabulary import (

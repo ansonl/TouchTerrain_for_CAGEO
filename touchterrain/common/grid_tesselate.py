@@ -40,7 +40,7 @@ import logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Sequence
 from typing import Union, Any
 
 import numpy as np
@@ -62,7 +62,6 @@ from touchterrain.common.shapely_utils import flatten_geometries
 from touchterrain.common.shapely_polygon_utils import (
     polygon_to_list_of_vertex,
 )
-from touchterrain.common.interpolate_Z import interpolate_z_planar
 
 from touchterrain.common.mesh_vocabulary import (
     BottomSurfaceProvider,
@@ -129,7 +128,7 @@ ASCII_STL_FACET_TEMPLATE = (
 )
 
 
-def _cleanup_cells_for_mesh_serialization(
+def cleanup_cells_for_mesh_serialization(
     cells: np.ndarray,
     output_fileformat: str,
     split_rotation: int,
@@ -1381,7 +1380,7 @@ class grid:
                 self.cells.shape[0],
             )
         )
-        _cleanup_cells_for_mesh_serialization(
+        cleanup_cells_for_mesh_serialization(
             self.cells,
             self.tile_info.config.fileformat,
             self.tile_info.config.split_rotation,
