@@ -98,6 +98,42 @@ if TYPE_CHECKING:
     from touchterrain.common.grid_tesselate import grid
 
 
+def _positive_z_difference_side_cut_walls(
+    corners: Sequence[IntermediateCorner],
+    cell_j: int,
+    cell_i: int,
+    plan: PositiveZNudgePlan,
+    difference_neighbor_split_sides: dict[tuple[int, int], set[str]],
+) -> set[str]:
+    """Return the split sides whose neighbour does not split to match.
+
+    A side the keep footprint cuts needs its own wall unless the neighbour cuts
+    the shared side too, either from its own plan record, from a propagated
+    split, or from its own difference corners.
+    """
+    side_cut_wall_sides: set[str] = set()
+    for current_side, neighbor_delta, neighbor_side in CELL_NEIGHBOR_SIDES:
+        if not _nudge_keep_footprint_splits_side(corners, current_side):
+            continue
+        neighbor_location = (
+            cell_j + neighbor_delta[0],
+            cell_i + neighbor_delta[1],
+        )
+        neighbor_record = plan.get(neighbor_location, {})
+        neighbor_matches = (
+            neighbor_side in neighbor_record.get("split_sides", ())
+        ) or (
+            neighbor_side
+            in difference_neighbor_split_sides.get(neighbor_location, ())
+        ) or _nudge_keep_footprint_splits_side(
+            _positive_z_effective_difference_corners(neighbor_record),
+            neighbor_side,
+        )
+        if not neighbor_matches:
+            side_cut_wall_sides.add(current_side)
+    return side_cut_wall_sides
+
+
 def apply_positive_z_plan_to_existing_cells(
     target: "grid",
     positive_z_nudge_plan: PositiveZNudgePlan,
@@ -228,42 +264,15 @@ def apply_positive_z_plan_to_existing_cells(
                 )
 
             if corners:
-                side_cut_wall_sides: set[str] = set()
-                for current_side, neighbor_location, neighbor_side in [
-                    ("N", (padded_row - 1, padded_col), "S"),
-                    ("S", (padded_row + 1, padded_col), "N"),
-                    ("W", (padded_row, padded_col - 1), "E"),
-                    ("E", (padded_row, padded_col + 1), "W"),
-                ]:
-                    if not _nudge_keep_footprint_splits_side(
+                side_cut_wall_sides = (
+                    _positive_z_difference_side_cut_walls(
                         corners,
-                        current_side,
-                    ):
-                        continue
-                    neighbor_record = positive_z_nudge_plan.get(
-                        neighbor_location,
-                        {},
+                        padded_row,
+                        padded_col,
+                        positive_z_nudge_plan,
+                        difference_neighbor_split_sides,
                     )
-                    neighbor_corners = (
-                        _positive_z_effective_difference_corners(
-                            neighbor_record,
-                        )
-                    )
-                    neighbor_matches = (
-                        neighbor_side
-                        in neighbor_record.get("split_sides", set())
-                    ) or (
-                        neighbor_side
-                        in difference_neighbor_split_sides.get(
-                            neighbor_location,
-                            set(),
-                        )
-                    ) or _nudge_keep_footprint_splits_side(
-                        neighbor_corners,
-                        neighbor_side,
-                    )
-                    if not neighbor_matches:
-                        side_cut_wall_sides.add(current_side)
+                )
                 changed = (
                     current_cell.apply_positive_z_difference_nudge(
                         corners,
@@ -2206,47 +2215,15 @@ def nudge_cell_surfaces(
                 )
             )
             if positive_z_difference_corners:
-                positive_z_side_cut_wall_sides = set()
-                for (
-                    current_side,
-                    neighbor_delta,
-                    neighbor_side,
-                ) in CELL_NEIGHBOR_SIDES:
-                    neighbor_location = (
-                        j + neighbor_delta[0],
-                        i + neighbor_delta[1],
-                    )
-                    if not _nudge_keep_footprint_splits_side(
+                positive_z_side_cut_wall_sides = (
+                    _positive_z_difference_side_cut_walls(
                         positive_z_difference_corners,
-                        current_side,
-                    ):
-                        continue
-                    neighbor_record = positive_z_nudge_plan.get(
-                        neighbor_location,
-                        empty_positive_z_record,
+                        j,
+                        i,
+                        positive_z_nudge_plan,
+                        positive_z_difference_neighbor_split_sides,
                     )
-                    neighbor_corners = (
-                        _positive_z_effective_difference_corners(
-                            neighbor_record,
-                        )
-                    )
-                    neighbor_matches = (
-                        neighbor_side
-                        in neighbor_record.get("split_sides", ())
-                    ) or (
-                        neighbor_side
-                        in (
-                            positive_z_difference_neighbor_split_sides
-                            .get(neighbor_location, ())
-                        )
-                    ) or _nudge_keep_footprint_splits_side(
-                        neighbor_corners,
-                        neighbor_side,
-                    )
-                    if not neighbor_matches:
-                        positive_z_side_cut_wall_sides.add(
-                            current_side,
-                        )
+                )
             if (
                 not positive_z_difference_corners
                 and top_bottom_surface_geometries_2D is None
