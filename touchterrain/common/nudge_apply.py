@@ -19,6 +19,7 @@ These take the grid as an ordinary argument so the module stays below
 ``grid_tesselate`` in the import order; ``grid`` keeps thin delegating methods.
 """
 
+import dataclasses
 import itertools
 
 from collections.abc import Iterable, Sequence
@@ -31,10 +32,16 @@ from touchterrain.common import nudge_cell_ops
 from touchterrain.common.Cell import cell
 from touchterrain.common.Quad import quad
 from touchterrain.common.Vertex import vertex
-from touchterrain.common.nudge_corner import IntermediateCorner
+from touchterrain.common.nudge_corner import (
+    IntermediateCorner,
+    z0_nudge_corners_from_source_raster,
+)
 from touchterrain.common.mesh_vocabulary import (
-    CARDINAL_DIRECTIONS,
+    BottomSurfaceProvider,
+    CELL_NEIGHBOR_SIDES,
+    CardinalWallMap,
     Coordinate,
+    CornerElevations,
     DirectedEdge3D,
     Edge3D,
     PositiveZNudgePlan,
@@ -43,6 +50,7 @@ from touchterrain.common.mesh_vocabulary import (
     SurfaceMesh,
     TopFootprintProvider,
     XYEdge,
+    _empty_borders,
     _merge_count_map,
     _parallel_range_results,
     _should_parallelize_rows,
@@ -54,18 +62,26 @@ from touchterrain.common.mesh_serialization import (
     boundary_edge_map_from_meshes,
     directed_edges_are_balanced,
     edge_3d_signature,
-    edge_xy_signature,
-    normalize_vertex_to_match_mesh_serialization,
+    normalize_coordinate_to_match_mesh_serialization,
     triangle_collapses_after_mesh_serialization,
     surface_mesh_edge_usage,
-    surface_polygon_normalized_to_match_mesh_serialization,
 )
 from touchterrain.common.surface_geometry import (
+    _create_cell_bottom_geometry,
+    _current_surface_footprint,
+    _surface_planes_from_current_geometry,
     _surface_wall_requested_lines,
+    _triangulate_2d_geometry_to_3d_polygons,
+    _union_polygon_footprint,
     make_wall_without_exact_duplicate_vertices,
 )
 from touchterrain.common.nudge_geometry import (
     _nudge_keep_footprint_splits_side,
+    _surface_polygons_with_midpoint_z,
+    _z0_adjusted_keep_surface_planes,
+    full_cell_footprint,
+    nudge_keep_footprint,
+    rebuild_nudged_surface_polygon_borders,
     _nudge_split_side_endpoint_edges,
     _nudge_split_side_endpoint_xy,
     edge_cardinal_side,
@@ -73,6 +89,7 @@ from touchterrain.common.nudge_geometry import (
 )
 from touchterrain.common.nudge_plan import (
     _positive_z_difference_neighbor_split_sides,
+    build_positive_z_nudge_plan,
     _positive_z_effective_difference_corners,
     _positive_z_neighbor_split_sides_from_plan,
 )
@@ -1477,3 +1494,798 @@ def _close_local_positive_z_boundary_edge_loops(
                 global_directed_counts.get(directed_edge, 0) + count
             )
         unused_edges.difference_update(cycle_edge_set)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NudgeSettings:
+    """Loop-invariant nudge inputs for one grid's cell-creation pass."""
+
+    enabled: bool
+    plan: PositiveZNudgePlan
+    difference_neighbor_split_sides: dict[tuple[int, int], set[str]]
+    z0_detection_raster: np.ndarray | None
+    using_difference_mesh: bool
+    has_bottom_surface_provider: bool
+    split_rotation: int
+    output_fileformat: str
+    zero_threshold: float
+
+
+@dataclasses.dataclass(slots=True)
+class CellNudgeOutcome:
+    """Per-cell nudge decisions the remaining cell steps must honor."""
+
+    record: PositiveZNudgeRecord
+    surfaces_collapsed: bool = False
+    z0_nudged: bool = False
+    z0_used_bottom_provider: bool = False
+    z0_full_footprint_2D: shapely.Geometry | None = None
+    z0_include_normal_cut_edges: bool = False
+    positive_z_nudged: bool = False
+    positive_z_full_footprint_2D: shapely.Geometry | None = None
+    difference_corners: list[IntermediateCorner] | None = None
+    split_sides: set[str] | None = None
+    protected_split_sides: set[str] | None = None
+    side_cut_wall_sides: set[str] | None = None
+    split_contact_corners: Sequence[IntermediateCorner] = ()
+    flip_edges: set[Edge3D] | None = None
+    top_polygons: list[shapely.Polygon] | None = None
+    bottom_polygons: list[shapely.Polygon] | None = None
+    bottomquad: quad | None = None
+
+    def nudge_owns_bottom_surface(self) -> bool:
+        """Return whether nudging already decided this cell's bottom."""
+        return bool(
+            self.z0_used_bottom_provider
+            or self.difference_corners
+            or self.split_sides
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ZeroHeightPreservation:
+    """XY points and half-edges a nudged split side must keep."""
+
+    xy: set[tuple[float, float]]
+    edges: set[XYEdge]
+
+
+def build_nudge_settings(
+    nudge_enabled: bool,
+    existing_plan: PositiveZNudgePlan | None,
+    positive_contact_top_raster: np.ndarray | None,
+    top_interpolation_raster: np.ndarray | None,
+    split_emit_raster: np.ndarray | None,
+    bottom_raster_for_z0_nudge: np.ndarray | None,
+    using_difference_mesh: bool,
+    has_bottom_surface_provider: bool,
+    cell_size: float,
+    offsetx: float,
+    offsety: float,
+    ymaxidx: int,
+    xmaxidx: int,
+    zero_threshold: float,
+    split_rotation: int,
+    output_fileformat: str,
+    config: Any,
+    parallel_task_count: int,
+) -> NudgeSettings:
+    """Resolve the plan and the loop-invariant nudge inputs for one pass.
+
+    A pair mesh is handed a plan that was already confirmed against emitted
+    geometry. The standalone through-base path has no such pass, so it builds
+    its own candidate plan here, and only that path resolves a worker count.
+    """
+    plan: PositiveZNudgePlan = existing_plan or {}
+    if (
+        nudge_enabled
+        and not plan
+        and not using_difference_mesh
+        and positive_contact_top_raster is not None
+    ):
+        plan = build_positive_z_nudge_plan(
+            upper_raster=positive_contact_top_raster,
+            lower_raster=top_interpolation_raster,
+            emit_raster=positive_contact_top_raster,
+            split_emit_raster=split_emit_raster,
+            cell_size=cell_size,
+            offsetx=offsetx,
+            offsety=offsety,
+            split_rotation=split_rotation,
+            ymaxidx=ymaxidx,
+            xmaxidx=xmaxidx,
+            zero_threshold=zero_threshold,
+            output_fileformat=output_fileformat,
+            parallel_workers=single_job_parallel_workers(
+                config,
+                parallel_task_count,
+            ),
+        )
+    return NudgeSettings(
+        enabled=nudge_enabled,
+        plan=plan,
+        difference_neighbor_split_sides=(
+            _positive_z_difference_neighbor_split_sides(plan)
+            if using_difference_mesh
+            else {}
+        ),
+        z0_detection_raster=(
+            bottom_raster_for_z0_nudge
+            if using_difference_mesh
+            else top_interpolation_raster
+        ),
+        using_difference_mesh=using_difference_mesh,
+        has_bottom_surface_provider=has_bottom_surface_provider,
+        split_rotation=split_rotation,
+        output_fileformat=output_fileformat,
+        zero_threshold=zero_threshold,
+    )
+
+
+def rebuild_nudged_cell_borders(
+    outcome: CellNudgeOutcome,
+    top_surface_polygons_triangulated_3D: list[shapely.Polygon] | None,
+    bottom_surface_polygons_triangulated_3D: list[shapely.Polygon] | None,
+    borders: CardinalWallMap,
+    surface_polygon_borders_3D: list[quad] | None,
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+    output_fileformat: str,
+) -> tuple[list[quad] | None, CardinalWallMap]:
+    """Replace a nudged cell's cardinal walls with surface polygon walls.
+
+    This has to run after the ordinary cardinal and clipped wall passes,
+    because the walls those requested are the input to the rebuild.
+    """
+    if not (outcome.z0_nudged or outcome.positive_z_nudged):
+        return surface_polygon_borders_3D, borders
+
+    if (
+        top_surface_polygons_triangulated_3D is None
+        or bottom_surface_polygons_triangulated_3D is None
+    ):
+        raise RuntimeError("Nudged cell is missing final surface polygons.")
+
+    if outcome.z0_nudged:
+        footprint = outcome.z0_full_footprint_2D
+        include_normal_cut_edges = outcome.z0_include_normal_cut_edges
+    else:
+        footprint = outcome.positive_z_full_footprint_2D
+        include_normal_cut_edges = False
+    if footprint is None:
+        footprint = full_cell_footprint(W, E, N, S)
+
+    surface_polygon_borders_3D = rebuild_nudged_surface_polygon_borders(
+        top_surface_polygons_triangulated_3D,
+        bottom_surface_polygons_triangulated_3D,
+        borders,
+        surface_polygon_borders_3D,
+        footprint,
+        include_normal_cut_edges=include_normal_cut_edges,
+        W=W,
+        E=E,
+        N=N,
+        S=S,
+        output_fileformat=output_fileformat,
+    )
+    return surface_polygon_borders_3D, _empty_borders()
+
+
+def finish_cell_nudge(
+    settings: NudgeSettings,
+    outcome: CellNudgeOutcome,
+    current_cell: cell,
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+) -> ZeroHeightPreservation | None:
+    """Split neighbour-matching midpoints and flip clipped contact diagonals.
+
+    Returns the XY points and half-edges that zero-height cleanup must keep,
+    because that cleanup runs in the caller.
+    """
+    if not settings.enabled:
+        return None
+
+    if outcome.split_sides and not outcome.difference_corners:
+        current_cell.split_surface_boundary_midpoints(
+            outcome.split_sides,
+            outcome.split_contact_corners,
+            W=W,
+            E=E,
+            N=N,
+            S=S,
+            split_rotation=settings.split_rotation,
+            output_fileformat=settings.output_fileformat,
+            include_contact_cut_walls=False,
+            side_cut_wall_sides=None,
+        )
+
+    preservation: ZeroHeightPreservation | None = None
+    if (
+        settings.using_difference_mesh
+        and outcome.split_sides
+        and not outcome.difference_corners
+        and outcome.protected_split_sides
+    ):
+        preservation = ZeroHeightPreservation(
+            xy=_nudge_split_side_endpoint_xy(
+                outcome.protected_split_sides,
+                W,
+                E,
+                N,
+                S,
+                settings.output_fileformat,
+            ),
+            edges=_nudge_split_side_endpoint_edges(
+                outcome.protected_split_sides,
+                W,
+                E,
+                N,
+                S,
+                settings.output_fileformat,
+            ),
+        )
+
+    if (
+        outcome.flip_edges
+        and settings.using_difference_mesh
+        and current_cell.topSurfacePolygons
+        and current_cell.bottomSurfacePolygons
+    ):
+        current_cell.flip_bottom_positive_z_contact_edges(
+            split_rotation=settings.split_rotation,
+            output_fileformat=settings.output_fileformat,
+            allowed_edges=outcome.flip_edges,
+        )
+
+    return preservation
+
+
+def finish_positive_z_difference_nudge(
+    settings: NudgeSettings,
+    outcome: CellNudgeOutcome,
+    current_cell: cell,
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+    bottom_surface_provider: BottomSurfaceProvider | None,
+    cell_row: int,
+    cell_col: int,
+    serialized_vertices: SerializedVertexCache,
+) -> None:
+    """Cut the confirmed contact footprint out of a difference cell.
+
+    Runs after the first zero-height cleanup, and re-seats the provider bottom
+    first so the cut is made against the corrected normal top.
+
+    The provider is indexed here rather than at the call site so cells that
+    never reach this repair are not looked up at all.
+    """
+    if not (
+        outcome.difference_corners
+        and settings.enabled
+        and settings.using_difference_mesh
+    ):
+        return
+
+    if bottom_surface_provider is not None:
+        bottom_quad, bottom_polygons = (
+            bottom_surface_provider[cell_row][cell_col]
+        )
+        if bottom_quad is not None or bottom_polygons is not None:
+            current_cell.replace_bottom_surfaces(
+                bottom_surface_quad=bottom_quad,
+                bottom_surface_polygons=bottom_polygons,
+                split_rotation=settings.split_rotation,
+                output_fileformat=settings.output_fileformat,
+            )
+
+    midpoints = dict(
+        outcome.record.get(
+            "difference_midpoint_z_by_name",
+            outcome.record.get("midpoint_z_by_name", {}),
+        ),
+    )
+    current_cell.apply_positive_z_difference_nudge(
+        outcome.difference_corners,
+        W=W,
+        E=E,
+        N=N,
+        S=S,
+        split_rotation=settings.split_rotation,
+        output_fileformat=settings.output_fileformat,
+        top_midpoint_z_by_name=midpoints,
+        bottom_midpoint_z_by_name=midpoints,
+        side_cut_wall_sides=outcome.side_cut_wall_sides,
+    )
+    current_cell.remove_zero_height_volumes(
+        split_rotation=settings.split_rotation,
+        output_fileformat=settings.output_fileformat,
+        serialized_vertices=serialized_vertices,
+    )
+
+
+def nudge_cell_surfaces(
+    settings: NudgeSettings,
+    j: int,
+    i: int,
+    topq: quad,
+    botq: quad | None,
+    bottom_corner_vertices: dict[IntermediateCorner, vertex] | None,
+    bottom_elevations: CornerElevations,
+    top_bottom_surface_geometries_2D: list[shapely.Geometry] | None,
+    top_surface_polygons_triangulated_3D: list[shapely.Polygon] | None,
+    bottom_surface_polygons_triangulated_3D: list[shapely.Polygon] | None,
+    clipped_surfaces_collapsed_after_output: bool,
+    W: float,
+    E: float,
+    N: float,
+    S: float,
+) -> "CellNudgeOutcome":
+    """Repair overused Z=0 and positive-Z contacts in one cell's surfaces.
+
+    Returns the replacement surfaces plus the decisions the remaining cell
+    steps must honor. The caller rebinds its own locals from the result, so the
+    None-versus-empty-list distinction that cell construction depends on is
+    preserved.
+    """
+    nudge_enabled = settings.enabled
+    positive_z_nudge_plan = settings.plan
+    using_difference_mesh = settings.using_difference_mesh
+    positive_z_difference_neighbor_split_sides = (
+        settings.difference_neighbor_split_sides
+    )
+    split_rotation = settings.split_rotation
+    output_fileformat = settings.output_fileformat
+    z0_detection_raster = settings.z0_detection_raster
+    zero_threshold = settings.zero_threshold
+    has_bottom_surface_provider = settings.has_bottom_surface_provider
+    empty_positive_z_record: PositiveZNudgeRecord = {}
+
+    z0_nudged_cell = False
+    z0_used_bottom_provider = False
+    z0_full_footprint_2D: shapely.Geometry | None = None
+    z0_include_normal_cut_edges = False
+    positive_z_nudged_cell = False
+    positive_z_full_footprint_2D: shapely.Geometry | None = None
+    positive_z_difference_corners: (
+        list[IntermediateCorner] | None
+    ) = None
+    positive_z_split_sides: set[str] | None = None
+    positive_z_protected_split_sides: set[str] | None = None
+    positive_z_side_cut_wall_sides: set[str] | None = None
+    positive_z_split_contact_corners: (
+        Sequence[IntermediateCorner]
+    ) = ()
+    positive_z_flip_edges: set[Edge3D] | None = None
+    positive_z_record = empty_positive_z_record
+    if nudge_enabled:
+        positive_z_record = positive_z_nudge_plan.get(
+            (j, i),
+            empty_positive_z_record,
+        )
+        positive_z_flip_edges = positive_z_record.get(
+            "flip_edges",
+        )
+
+        z0_corners = (
+            z0_nudge_corners_from_source_raster(
+                z0_detection_raster,
+                (j, i),
+                zero_threshold=zero_threshold,
+            )
+            if z0_detection_raster is not None
+            else []
+        )
+        if z0_corners:
+            NWt, SWt, SEt, NEt = topq.vl
+            if (
+                NWt is None
+                or SWt is None
+                or SEt is None
+                or NEt is None
+            ):
+                raise RuntimeError(
+                    "Z0 nudge needs four top corner vertices."
+                )
+            cell_top_corner_vertices = {
+                IntermediateCorner.NW: NWt,
+                IntermediateCorner.NE: NEt,
+                IntermediateCorner.SW: SWt,
+                IntermediateCorner.SE: SEt,
+            }
+            if botq is None:
+                (
+                    botq,
+                    bottom_corner_vertices,
+                ) = _create_cell_bottom_geometry(
+                    W,
+                    E,
+                    N,
+                    S,
+                    *bottom_elevations,
+                    nudge_enabled,
+                )
+            if bottom_corner_vertices is None:
+                raise RuntimeError(
+                    "Z0 nudge needs bottom corner vertices.",
+                )
+            cell_bottom_corner_vertices = bottom_corner_vertices
+
+            def output_z_is_zero(v: vertex) -> bool:
+                return (
+                    normalize_coordinate_to_match_mesh_serialization(
+                        v.coords[2],
+                        output_fileformat,
+                    )
+                    == 0
+                )
+
+            if not using_difference_mesh:
+                z0_corners = [
+                    corner
+                    for corner in z0_corners
+                    if output_z_is_zero(
+                        cell_top_corner_vertices[corner],
+                    )
+                    and output_z_is_zero(
+                        cell_bottom_corner_vertices[corner],
+                    )
+                ]
+            else:
+                z0_corners = [
+                    corner
+                    for corner in z0_corners
+                    if output_z_is_zero(
+                        cell_bottom_corner_vertices[corner],
+                    )
+                ]
+        if 0 < len(z0_corners) < 4:
+            cell_footprint_2D = full_cell_footprint(
+                W,
+                E,
+                N,
+                S,
+            )
+            keep_footprint = nudge_keep_footprint(
+                z0_corners,
+                W,
+                E,
+                N,
+                S,
+            )
+            if keep_footprint is not None:
+                canonicalize_clipped_nudge_xy = (
+                    top_bottom_surface_geometries_2D is not None
+                )
+                z0_full_footprint_2D = _union_polygon_footprint(
+                    top_bottom_surface_geometries_2D,
+                    cell_footprint_2D,
+                )
+                keep_geometry = z0_full_footprint_2D.intersection(
+                    keep_footprint,
+                )
+                complement_geometry = (
+                    z0_full_footprint_2D.difference(
+                        keep_footprint,
+                    )
+                )
+                top_planes = topq.get_triangles_in_polygons(
+                    split_rotation=split_rotation,
+                )
+                z0_top_planes = _z0_adjusted_keep_surface_planes(
+                    z0_corners,
+                    cell_top_corner_vertices,
+                    W,
+                    E,
+                    N,
+                    S,
+                )
+                z0_bottom_planes = _z0_adjusted_keep_surface_planes(
+                    z0_corners,
+                    cell_bottom_corner_vertices,
+                    W,
+                    E,
+                    N,
+                    S,
+                )
+                z0_planes = quad(
+                    vertex(W, N, 0),
+                    vertex(W, S, 0),
+                    vertex(E, S, 0),
+                    vertex(E, N, 0),
+                ).get_triangles_in_polygons(
+                    split_rotation=split_rotation,
+                )
+                if not using_difference_mesh:
+                    top_surface_polygons_triangulated_3D = (
+                        _triangulate_2d_geometry_to_3d_polygons(
+                            keep_geometry,
+                            z0_top_planes,
+                            exterior_cw=False,
+                            output_fileformat=output_fileformat,
+                            canonicalize_serialized_xy=(
+                                canonicalize_clipped_nudge_xy
+                            ),
+                        )
+                    )
+                    bottom_surface_polygons_triangulated_3D = (
+                        _triangulate_2d_geometry_to_3d_polygons(
+                            keep_geometry,
+                            z0_planes,
+                            exterior_cw=True,
+                            output_fileformat=output_fileformat,
+                            canonicalize_serialized_xy=(
+                                canonicalize_clipped_nudge_xy
+                            ),
+                        )
+                    )
+                    z0_include_normal_cut_edges = True
+                else:
+                    if has_bottom_surface_provider:
+                        z0_used_bottom_provider = True
+                    if top_bottom_surface_geometries_2D is not None:
+                        z0_include_normal_cut_edges = True
+                    kept_bottom_polygons = (
+                        _triangulate_2d_geometry_to_3d_polygons(
+                            keep_geometry,
+                            z0_bottom_planes,
+                            exterior_cw=True,
+                            output_fileformat=output_fileformat,
+                            canonicalize_serialized_xy=(
+                                canonicalize_clipped_nudge_xy
+                            ),
+                        )
+                    )
+
+                    top_surface_polygons_triangulated_3D = []
+                    for top_piece in (
+                        keep_geometry,
+                        complement_geometry,
+                    ):
+                        top_surface_polygons_triangulated_3D.extend(
+                            _triangulate_2d_geometry_to_3d_polygons(
+                                top_piece,
+                                top_planes,
+                                exterior_cw=False,
+                                output_fileformat=output_fileformat,
+                                canonicalize_serialized_xy=(
+                                    canonicalize_clipped_nudge_xy
+                                ),
+                            )
+                        )
+
+                    bottom_surface_polygons_triangulated_3D = (
+                        kept_bottom_polygons
+                        + _triangulate_2d_geometry_to_3d_polygons(
+                            complement_geometry,
+                            z0_planes,
+                            exterior_cw=True,
+                            output_fileformat=output_fileformat,
+                            canonicalize_serialized_xy=(
+                                canonicalize_clipped_nudge_xy
+                            ),
+                        )
+                    )
+
+                if (
+                    top_surface_polygons_triangulated_3D
+                    and bottom_surface_polygons_triangulated_3D
+                ):
+                    z0_nudged_cell = True
+                else:
+                    clipped_surfaces_collapsed_after_output = True
+
+        if not using_difference_mesh:
+            positive_contact_corners = positive_z_record.get(
+                "corners",
+                (),
+            )
+
+            if 0 < len(positive_contact_corners) < 4:
+                cell_footprint_2D = full_cell_footprint(
+                    W,
+                    E,
+                    N,
+                    S,
+                )
+                positive_z_full_footprint_2D = (
+                    _current_surface_footprint(
+                        top_surface_polygons_triangulated_3D,
+                        cell_footprint_2D,
+                    )
+                )
+                keep_footprint = nudge_keep_footprint(
+                    positive_contact_corners,
+                    W,
+                    E,
+                    N,
+                    S,
+                )
+                if keep_footprint is not None:
+                    canonicalize_clipped_nudge_xy = (
+                        top_bottom_surface_geometries_2D is not None
+                    )
+                    keep_geometry = (
+                        positive_z_full_footprint_2D.intersection(
+                            keep_footprint,
+                        )
+                    )
+                    complement_geometry = (
+                        positive_z_full_footprint_2D.difference(
+                            keep_footprint,
+                        )
+                    )
+                    top_planes = _surface_planes_from_current_geometry(
+                        topq,
+                        top_surface_polygons_triangulated_3D,
+                        split_rotation,
+                    )
+                    bottom_planes = (
+                        botq.get_triangles_in_polygons(
+                            split_rotation=split_rotation,
+                        )
+                    )
+                    new_top_polygons: list[shapely.Polygon] = []
+                    new_bottom_polygons: list[shapely.Polygon] = []
+                    for piece in (
+                        keep_geometry,
+                        complement_geometry,
+                    ):
+                        new_top_polygons.extend(
+                            _triangulate_2d_geometry_to_3d_polygons(
+                                piece,
+                                top_planes,
+                                exterior_cw=False,
+                                output_fileformat=output_fileformat,
+                                canonicalize_serialized_xy=(
+                                    canonicalize_clipped_nudge_xy
+                                ),
+                            )
+                        )
+                        new_bottom_polygons.extend(
+                            _triangulate_2d_geometry_to_3d_polygons(
+                                piece,
+                                bottom_planes,
+                                exterior_cw=True,
+                                output_fileformat=output_fileformat,
+                                canonicalize_serialized_xy=(
+                                    canonicalize_clipped_nudge_xy
+                                ),
+                            )
+                        )
+
+                    if positive_z_record.get("midpoint_z_by_name"):
+                        new_top_polygons = (
+                            _surface_polygons_with_midpoint_z(
+                                new_top_polygons,
+                                W,
+                                E,
+                                N,
+                                S,
+                                None,
+                                output_fileformat,
+                                positive_z_record[
+                                    "midpoint_z_by_name"
+                                ],
+                            )
+                        )
+
+                    if new_top_polygons and new_bottom_polygons:
+                        top_surface_polygons_triangulated_3D = (
+                            new_top_polygons
+                        )
+                        bottom_surface_polygons_triangulated_3D = (
+                            new_bottom_polygons
+                        )
+                        positive_z_nudged_cell = True
+                    else:
+                        clipped_surfaces_collapsed_after_output = True
+            elif (
+                positive_z_record.get("split_sides")
+                and top_bottom_surface_geometries_2D is None
+            ):
+                positive_z_split_sides = set(
+                    positive_z_record["split_sides"],
+                )
+                positive_z_split_contact_corners = (
+                    positive_z_record.get(
+                        "contact_corners",
+                        (),
+                    )
+                )
+        else:
+            positive_z_difference_corners = (
+                _positive_z_effective_difference_corners(
+                    positive_z_record,
+                )
+            )
+            if positive_z_difference_corners:
+                positive_z_side_cut_wall_sides = set()
+                for (
+                    current_side,
+                    neighbor_delta,
+                    neighbor_side,
+                ) in CELL_NEIGHBOR_SIDES:
+                    neighbor_location = (
+                        j + neighbor_delta[0],
+                        i + neighbor_delta[1],
+                    )
+                    if not _nudge_keep_footprint_splits_side(
+                        positive_z_difference_corners,
+                        current_side,
+                    ):
+                        continue
+                    neighbor_record = positive_z_nudge_plan.get(
+                        neighbor_location,
+                        empty_positive_z_record,
+                    )
+                    neighbor_corners = (
+                        _positive_z_effective_difference_corners(
+                            neighbor_record,
+                        )
+                    )
+                    neighbor_matches = (
+                        neighbor_side
+                        in neighbor_record.get("split_sides", ())
+                    ) or (
+                        neighbor_side
+                        in (
+                            positive_z_difference_neighbor_split_sides
+                            .get(neighbor_location, ())
+                        )
+                    ) or _nudge_keep_footprint_splits_side(
+                        neighbor_corners,
+                        neighbor_side,
+                    )
+                    if not neighbor_matches:
+                        positive_z_side_cut_wall_sides.add(
+                            current_side,
+                        )
+            if (
+                not positive_z_difference_corners
+                and top_bottom_surface_geometries_2D is None
+            ):
+                positive_z_split_sides = set(
+                    positive_z_record.get("split_sides", ()),
+                )
+                positive_z_protected_split_sides = set(
+                    positive_z_split_sides,
+                )
+                positive_z_split_sides.update(
+                    positive_z_difference_neighbor_split_sides.get(
+                        (j, i),
+                        (),
+                    )
+                )
+                if positive_z_split_sides:
+                    positive_z_split_contact_corners = (
+                        positive_z_record.get(
+                            "contact_corners",
+                            (),
+                        )
+                    )
+    return CellNudgeOutcome(
+        record=positive_z_record,
+        surfaces_collapsed=clipped_surfaces_collapsed_after_output,
+        z0_nudged=z0_nudged_cell,
+        z0_used_bottom_provider=z0_used_bottom_provider,
+        z0_full_footprint_2D=z0_full_footprint_2D,
+        z0_include_normal_cut_edges=z0_include_normal_cut_edges,
+        positive_z_nudged=positive_z_nudged_cell,
+        positive_z_full_footprint_2D=positive_z_full_footprint_2D,
+        difference_corners=positive_z_difference_corners,
+        split_sides=positive_z_split_sides,
+        protected_split_sides=positive_z_protected_split_sides,
+        side_cut_wall_sides=positive_z_side_cut_wall_sides,
+        split_contact_corners=positive_z_split_contact_corners,
+        flip_edges=positive_z_flip_edges,
+        top_polygons=top_surface_polygons_triangulated_3D,
+        bottom_polygons=bottom_surface_polygons_triangulated_3D,
+        bottomquad=botq,
+    )
