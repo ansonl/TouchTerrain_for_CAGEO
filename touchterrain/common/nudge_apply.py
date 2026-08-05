@@ -1,11 +1,18 @@
 # nudge_apply.py
 # drive nudge repairs across a whole grid of already-built cells
 
-"""Grid-wide positive-Z repair.
+"""Grid-wide positive-Z repair, and the cell-creation nudge seam.
 
 An interlocking pair is generated in two passes: both meshes are built, the
 plan is confirmed against what they actually emitted, and only then is the
-repair applied back onto the existing cells. This module is that second pass.
+repair applied back onto the existing cells. The first half of this module is
+that second pass.
+
+The second half, from ``NudgeSettings`` down, is the seam ``create_cells``
+calls while it builds those cells. In practice only the Z=0 repair runs there:
+the positive-Z plan is empty until the pair driver confirms one, so every
+positive-Z branch in ``nudge_cell_surfaces`` is skipped during creation. See
+``build_nudge_settings`` for why.
 
 ``apply_positive_z_plan_to_existing_cells`` walks the confirmed plan and calls
 the per-cell operations in ``nudge_cell_ops``. Two grid-wide passes follow it
@@ -1581,9 +1588,22 @@ def build_nudge_settings(
 ) -> NudgeSettings:
     """Resolve the plan and the loop-invariant nudge inputs for one pass.
 
-    A pair mesh is handed a plan that was already confirmed against emitted
-    geometry. The standalone through-base path has no such pass, so it builds
-    its own candidate plan here, and only that path resolves a worker count.
+    Everything returned is constant across the cell loop, so it is resolved
+    once here rather than per cell.
+
+    The positive-Z plan is a pass-through of whatever the caller put on the
+    tile. No in-tree caller puts anything there, so ``plan`` is empty for the
+    whole of ``create_cells`` and only the Z=0 half of ``nudge_cell_surfaces``
+    does any work. An interlocking pair does not feed its plan in through this
+    parameter: it builds both meshes plan-less, confirms a plan against what
+    they emitted, and applies it afterwards through
+    ``apply_positive_z_plan_to_existing_cells``.
+
+    The self-planning branch below is therefore reachable only from outside
+    the package, by constructing a ``ProcessingTile`` with
+    ``positive_contact_top_raster`` set. Note that it produces *unconfirmed*
+    candidates, which ``spec/positive_z_overused_edge_nudge.md`` does not
+    sanction, and that it is the only branch resolving a worker count.
     """
     plan: PositiveZNudgePlan = existing_plan or {}
     if (
